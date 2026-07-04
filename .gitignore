@@ -1,0 +1,18 @@
+# Ignore exported build artifacts and deployment packages
+build/
+dist/
+exports/
+scan/
+
+# Python environment and caches
+.venv/
+.venv-1/
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor folders
+.vscode/

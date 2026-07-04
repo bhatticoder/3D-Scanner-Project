@@ -1,0 +1,20 @@
+{
+    "tripo_api_key": "tsk_cQcD0B6BB3a7vc9bz2ciNL8yj0ev6DoclS24GJ779ze",
+    "arduino_port": "COM4",
+    "arduino_baud": 9600,
+    "output_path": "C:\\Users\\Mudasar Bhatti\\Downloads\\scanned_object.glb",
+    "num_images": 8,
+    "camera_index": 1,
+    "students": [
+        {
+            "name": "Member 1",
+            "roll": "23f-1111"
+        },
+        {
+            "name": "member 2",
+            "roll": "22f-1111"
+        }
+    ],
+    "export_dir": "G:\\app\\exports",
+    "rotation_step": 10
+}

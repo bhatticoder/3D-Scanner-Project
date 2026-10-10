@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QTextBrowser, QFrame,
     QFileDialog, QMessageBox, QGroupBox, QStackedWidget, QDialog,
     QDialogButtonBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFormLayout
+    QHeaderView, QFormLayout, QCheckBox, QProgressBar
 )
 from PyQt6.QtCore  import Qt, QThread, pyqtSignal, pyqtSlot, QUrl
 from PyQt6.QtGui   import QImage, QPixmap, QFont
@@ -77,6 +77,10 @@ def save_settings(s):
     json.dump(s, open(CONFIG_PATH, "w"), indent=4)
 
 SETTINGS = load_settings()
+
+
+# ── Universal 3D Converter Integration ─────────────────────────────────────────
+from converter import convert_model_to_all_formats, open_in_blender, find_blender
 
 
 # ── Settings Dialog ───────────────────────────────────────────────────────────
@@ -247,6 +251,266 @@ class CameraThread(QThread):
         self.wait()
 
 
+# ── Image-to-Model Thread (Tripo V3 API) ─────────────────────────────────────
+class ImageToModelThread(QThread):
+    """Generates a 3D model from a single image using Tripo V3 image-to-model API."""
+    log_msg       = pyqtSignal(str)
+    progress_pct  = pyqtSignal(int)
+    scan_complete = pyqtSignal(str)
+    scan_error    = pyqtSignal(str)
+
+    def __init__(self, image_path, settings, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.settings   = settings
+
+    def run(self):
+        try:
+            api_key = self.settings.get("tripo_api_key", "")
+            if not api_key:
+                raise RuntimeError("No Tripo API key configured. Go to Settings ⚙ to add your key.")
+
+            h = {"Authorization": f"Bearer {api_key}"}
+            base_url = "https://openapi.tripo3d.ai"
+
+            # Step 1: Upload the image
+            self.log_msg.emit("📤 Uploading image to Tripo3D cloud...")
+            self.progress_pct.emit(10)
+
+            with open(self.image_path, "rb") as f:
+                fname = os.path.basename(self.image_path)
+                ext = os.path.splitext(fname)[1].lower()
+                mime = {
+                    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".png": "image/png", ".webp": "image/webp",
+                    ".bmp": "image/bmp"
+                }.get(ext, "image/jpeg")
+
+                r = requests.post(
+                    f"{base_url}/v3/files",
+                    headers=h,
+                    files={"file": (fname, f, mime)}
+                )
+                r.raise_for_status()
+                res = r.json()
+
+                if res.get("code") != 0:
+                    raise RuntimeError(f"Upload failed: {res.get('message', 'Unknown error')}")
+
+                file_token = res["data"]["file_token"]
+                self.log_msg.emit(f"✅ Image uploaded. Token: {file_token[:20]}...")
+
+            # Step 2: Create image-to-model task
+            self.log_msg.emit("🔨 Creating 3D generation task (image-to-model)...")
+            self.progress_pct.emit(25)
+
+            payload = {
+                "model_version": "v2.5-20250123",
+                "file": {
+                    "type": ext.lstrip(".") if ext.lstrip(".") in ("jpg","jpeg","png","webp","bmp") else "jpg",
+                    "file_token": file_token
+                },
+                "texture": True,
+                "pbr": True
+            }
+
+            r = requests.post(
+                f"{base_url}/v3/generation/image-to-model",
+                headers={**h, "Content-Type": "application/json"},
+                json=payload
+            )
+            r.raise_for_status()
+            task_res = r.json()
+
+            if task_res.get("code") != 0:
+                raise RuntimeError(f"Task creation failed: {task_res.get('message', 'Unknown error')}")
+
+            task_id = task_res["data"]["task_id"]
+            self.log_msg.emit(f"🆔 Task created: {task_id}")
+
+            # Step 3: Poll for completion
+            self.log_msg.emit("⏳ Waiting for 3D model generation...")
+            self.progress_pct.emit(35)
+
+            start_time = time.time()
+            timeout = 600  # 10 minutes max
+            while True:
+                if time.time() - start_time > timeout:
+                    raise TimeoutError("3D generation timed out after 10 minutes.")
+
+                r = requests.get(
+                    f"{base_url}/v3/tasks/{task_id}",
+                    headers=h
+                )
+                r.raise_for_status()
+                d = r.json()["data"]
+
+                status = d["status"]
+                progress = d.get("progress", 0)
+
+                # Map progress to our bar (35-85%)
+                mapped_pct = 35 + int(progress * 0.5)
+                self.progress_pct.emit(min(mapped_pct, 85))
+
+                self.log_msg.emit(f"   Status: {status.upper()} | Progress: {progress}%")
+
+                if status == "success":
+                    out = d.get("output", {})
+                    model_url = out.get("model_url")
+                    if not model_url:
+                        raise RuntimeError("Task succeeded but no model_url in output.")
+                    break
+                elif status in ("failed", "cancelled"):
+                    err_msg = d.get("error_message", "Unknown error")
+                    err_code = d.get("error_code", "N/A")
+                    raise RuntimeError(f"Generation {status}: [{err_code}] {err_msg}")
+
+                time.sleep(3)
+
+            # Step 4: Download the model
+            self.log_msg.emit("📥 Downloading 3D model...")
+            self.progress_pct.emit(90)
+
+            r = requests.get(model_url, stream=True)
+            r.raise_for_status()
+
+            export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
+            os.makedirs(export_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            clean_name = os.path.splitext(os.path.basename(self.image_path))[0]
+            final_path = os.path.join(export_dir, f"{clean_name}_{timestamp}.glb")
+
+            with open(final_path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+
+            self.settings["output_path"] = final_path
+            self.log_msg.emit(f"✅ Model saved: {final_path}")
+
+            # Step 5: Auto-export additional formats (OBJ, STL, FBX, BLEND)
+            self.progress_pct.emit(95)
+            self._export_formats(final_path, task_id=task_id)
+
+            self.progress_pct.emit(100)
+            self.scan_complete.emit(final_path)
+
+        except Exception as e:
+            self.scan_error.emit(str(e))
+
+    def _export_formats(self, glb_path, task_id=None):
+        """Export to OBJ, STL, FBX, and Blender .blend for universal compatibility."""
+        try:
+            self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
+            clean_name = os.path.splitext(os.path.basename(glb_path))[0]
+            convert_model_to_all_formats(
+                glb_path,
+                export_dir=os.path.dirname(glb_path),
+                base_name=clean_name,
+                tripo_task_id=task_id,
+                tripo_api_key=self.settings.get("tripo_api_key"),
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+            self.log_msg.emit("✅ Universal exports generated: GLB, OBJ, STL, FBX, .BLEND")
+        except Exception as e:
+            self.log_msg.emit(f"[WARN] Multi-format export warning: {e}")
+
+
+# ── Multiview-to-Model Thread (Tripo V3 API) ─────────────────────────────────
+class MultiviewToModelThread(QThread):
+    """Generates a 3D model from multiple perspective photos using Tripo V3 multiview-to-model API."""
+    log_msg       = pyqtSignal(str)
+    progress_pct  = pyqtSignal(int)
+    scan_complete = pyqtSignal(str)
+    scan_error    = pyqtSignal(str)
+
+    def __init__(self, image_paths, settings, base_name="multiview_model", parent=None):
+        super().__init__(parent)
+        self.image_paths = image_paths
+        self.settings    = settings
+        self.base_name   = base_name
+
+    def run(self):
+        try:
+            api_key = self.settings.get("tripo_api_key", "")
+            if not api_key:
+                raise RuntimeError("No Tripo API key configured. Go to Settings ⚙ to add your key.")
+
+            from pipeline import generate_from_multiview_images
+            export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
+            os.makedirs(export_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            full_base = f"{self.base_name}_{timestamp}"
+
+            self.log_msg.emit(f"📤 Uploading {len(self.image_paths)} images to Tripo3D cloud...")
+            self.progress_pct.emit(15)
+
+            glb_path, task_id = generate_from_multiview_images(
+                self.image_paths,
+                api_key,
+                export_dir,
+                base_name=full_base,
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+            self.progress_pct.emit(85)
+
+            self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
+            convert_model_to_all_formats(
+                glb_path,
+                export_dir=export_dir,
+                base_name=full_base,
+                tripo_task_id=task_id,
+                tripo_api_key=api_key,
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+
+            self.settings["output_path"] = glb_path
+            self.progress_pct.emit(100)
+            self.scan_complete.emit(glb_path)
+        except Exception as e:
+            self.scan_error.emit(str(e))
+
+
+# ── Blender Export Thread ─────────────────────────────────────────────────────
+class BlenderExportThread(QThread):
+    """Converts a GLB model to FBX, OBJ, STL, GLB, and native Blender .blend."""
+    log_msg       = pyqtSignal(str)
+    export_done   = pyqtSignal(str)
+    export_error  = pyqtSignal(str)
+
+    def __init__(self, glb_path, export_format, settings, parent=None):
+        super().__init__(parent)
+        self.glb_path      = glb_path
+        self.export_format = export_format  # "FBX", "OBJ", "GLB", "STL", "BLEND"
+        self.settings      = settings
+
+    def run(self):
+        try:
+            export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
+            os.makedirs(export_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            base_name = os.path.splitext(os.path.basename(self.glb_path))[0]
+            fmt_upper = self.export_format.upper()
+
+            self.log_msg.emit(f"🔄 Exporting to {fmt_upper} for Blender...")
+
+            results = convert_model_to_all_formats(
+                self.glb_path,
+                export_dir=export_dir,
+                base_name=f"{base_name}_{timestamp}",
+                tripo_api_key=self.settings.get("tripo_api_key"),
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+
+            target_key = fmt_upper.lower()
+            if target_key in results:
+                self.export_done.emit(results[target_key])
+            else:
+                self.export_done.emit(results.get("blend", results.get("glb", self.glb_path)))
+
+        except Exception as e:
+            self.export_error.emit(str(e))
+
+
 # ── Scan Thread ───────────────────────────────────────────────────────────────
 class HardwareScanThread(QThread):
     log_msg       = pyqtSignal(str)
@@ -377,7 +641,7 @@ class HardwareScanThread(QThread):
 
             with open(path, "rb") as f:
                 r = requests.post(
-                    "https://api.tripo3d.ai/v2/openapi/upload/sts", 
+                    "https://openapi.tripo3d.ai/v3/files", 
                     headers=h, 
                     files={"file": (name, f, "image/jpeg")}
                 )
@@ -391,8 +655,8 @@ class HardwareScanThread(QThread):
                 if not data_block:
                     raise KeyError(f"Missing data block in upload response. Response: {res_json}")
                 
-                # FIXED: Tripo3D STS endpoint uses 'image_token' instead of 'file_token'
-                token = data_block.get("image_token") or data_block.get("file_token")
+                # V3: The response key changed from image_token back to file_token
+                token = data_block.get("file_token")
                 if not token:
                     raise KeyError(f"Could not locate an image token. Keys available: {list(data_block.keys())}")
                     
@@ -400,8 +664,7 @@ class HardwareScanThread(QThread):
 
         # Assemble your explicit payload mappings with structural validation
         payload = {
-            "type": "multiview_to_model",
-            "output_format": "glb",
+            "model_version": "v2.5-20250123",
             "files": [
                 {"type": "jpg", "file_token": tokens[0], "orientation": "front"},
                 {"type": "jpg", "file_token": tokens[1], "orientation": "right"}, 
@@ -410,7 +673,7 @@ class HardwareScanThread(QThread):
             ]
         }
         
-        r = requests.post("https://api.tripo3d.ai/v2/openapi/task", headers={**h, "Content-Type": "application/json"}, json=payload)
+        r = requests.post("https://openapi.tripo3d.ai/v3/generation/multiview-to-model", headers={**h, "Content-Type": "application/json"}, json=payload)
         r.raise_for_status()
         
         task_json = r.json()
@@ -421,30 +684,51 @@ class HardwareScanThread(QThread):
 
     def _poll(self, tid):
         while True:
-            r = requests.get(f"https://api.tripo3d.ai/v2/openapi/task/{tid}", headers={"Authorization":f"Bearer {self.settings['tripo_api_key']}"})
+            r = requests.get(f"https://openapi.tripo3d.ai/v3/tasks/{tid}", headers={"Authorization":f"Bearer {self.settings['tripo_api_key']}"})
             r.raise_for_status()
             d = r.json()["data"]
             self.log_msg.emit(f"Status: {d['status'].upper()}")
             if d["status"] == "success":
                 out = d.get("output",{})
-                return out[0].get("model") if isinstance(out,list) else (out.get("pbr_model") or out.get("model"))
-            if d["status"] in ("failed","error"): raise RuntimeError("Tripo3D processing failed.")
+                return out[0].get("model_url") if isinstance(out,list) else out.get("model_url")
+            if d["status"] in ("failed","cancelled"): raise RuntimeError(f"Tripo3D processing failed with status {d['status']}: {d.get('error_message', 'Unknown Error')}")
             time.sleep(3)
 
     def _dl(self, url):
             r = requests.get(url, stream=True)
             r.raise_for_status()
-            with open(self.settings["output_path"],"wb") as f:
+            
+            export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            final_path = os.path.join(export_dir, f"scanned_model_{timestamp}.glb")
+            
+            with open(final_path, "wb") as f:
                 for chunk in r.iter_content(8192): 
                     f.write(chunk)
+            
+            self.settings["output_path"] = final_path
+            
+            # Automatically export ALL formats: GLB, OBJ, STL, FBX, BLEND
+            try:
+                self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
+                convert_model_to_all_formats(
+                    final_path,
+                    export_dir=export_dir,
+                    base_name=f"scanned_model_{timestamp}",
+                    tripo_api_key=self.settings.get("tripo_api_key"),
+                    log_fn=lambda m: self.log_msg.emit(m)
+                )
+                self.log_msg.emit("✅ Universal exports generated: GLB, OBJ, STL, FBX, .BLEND")
+            except Exception as e:
+                self.log_msg.emit(f"[WARN] Universal format export warning: {e}")
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 class ModernScannerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Complete 3D Scanner Application")
-        self.resize(1100, 680)
+        self.setWindowTitle("3D Object Scanner & Reconstruction Studio")
+        self.resize(1200, 740)
         self.setStyleSheet("""
             QMainWindow  { background:#101010; color:#fff; }
             QLabel       { color:#fff; }
@@ -459,6 +743,15 @@ class ModernScannerApp(QMainWindow):
                          border:1px solid #444; border-radius:3px; }
             QGroupBox  { border:1px solid #333; margin-top:1ex;
                          font-weight:bold; color:#777; }
+            QProgressBar {
+                background:#222; border:1px solid #444; border-radius:4px;
+                text-align:center; color:#fff; font-weight:bold;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00BCD4, stop:1 #2196F3);
+                border-radius:3px;
+            }
         """)
 
         # State
@@ -471,6 +764,8 @@ class ModernScannerApp(QMainWindow):
         self.camera_enabled             = True
         self.camera_frame_lock          = threading.Lock()
         self._cam_auto_paused           = False  # True when stopped for Auto Turntable
+        self._current_model_path        = None   # Track loaded model for export
+        self._labels_visible            = True    # Toggle labels on/off
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -502,14 +797,15 @@ class ModernScannerApp(QMainWindow):
 
     # ── UI builders ───────────────────────────────────────────────────────────
     def _left_panel(self):
-        p = QFrame(); p.setFixedWidth(300)
+        p = QFrame(); p.setFixedWidth(320)
         p.setStyleSheet("background:#1a1a1a;")
-        lay = QVBoxLayout(p); lay.setContentsMargins(20, 20, 20, 20)
+        lay = QVBoxLayout(p); lay.setContentsMargins(16, 16, 16, 16)
 
         # Title row + ⚙ gear button
         title_row = QHBoxLayout()
-        t = QLabel("3D RECONSTRUCTION")
+        t = QLabel("3D OBJECT SCANNER")
         f = QFont(); f.setPointSize(13); f.setBold(True); t.setFont(f)
+        t.setStyleSheet("color:#00BCD4;")
         title_row.addWidget(t, stretch=1)
         btn_gear = QPushButton("⚙")
         btn_gear.setFixedSize(32, 32)
@@ -520,14 +816,82 @@ class ModernScannerApp(QMainWindow):
         btn_gear.clicked.connect(self.open_settings)
         title_row.addWidget(btn_gear)
         lay.addLayout(title_row)
-        lay.addSpacing(12)
+        lay.addSpacing(8)
+
+        # ── Progress Bar ──────────────────────────────────────────────────────
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(18)
+        self.progress_bar.setVisible(False)
+        lay.addWidget(self.progress_bar)
+        lay.addSpacing(4)
+
+        # ── AI 3D Reconstruction from Photos ─────────────────────────────────
+        gen_box = QGroupBox("✨ AI 3D Reconstruction")
+        gen_box.setStyleSheet("""
+            QGroupBox { 
+                border: 1px solid #00BCD4; margin-top:1ex; 
+                font-weight:bold; color:#00BCD4; 
+                padding-top: 14px;
+            }
+        """)
+        gen_lay = QVBoxLayout(gen_box)
+
+        self.btn_gen_image = QPushButton("📸  Single Photo → 3D")
+        self.btn_gen_image.setStyleSheet("""
+            QPushButton { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00897B, stop:1 #00BCD4);
+                color: #fff; font-size: 11px; padding: 7px;
+                border-radius: 5px;
+            }
+            QPushButton:hover { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00ACC1, stop:1 #26C6DA);
+            }
+        """)
+        self.btn_gen_image.clicked.connect(self.generate_from_image)
+        gen_lay.addWidget(self.btn_gen_image)
+
+        self.btn_gen_multi = QPushButton("🖼️  Multiple Photos (Multiview)")
+        self.btn_gen_multi.setStyleSheet("""
+            QPushButton { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00695C, stop:1 #00897B);
+                color: #fff; font-size: 11px; padding: 7px;
+                border-radius: 5px;
+            }
+            QPushButton:hover { background: #009688; }
+        """)
+        self.btn_gen_multi.clicked.connect(self.generate_from_multiple_images)
+        gen_lay.addWidget(self.btn_gen_multi)
+
+        self.btn_gen_folder = QPushButton("📁  Folder of Photos → 3D")
+        self.btn_gen_folder.setStyleSheet("""
+            QPushButton { 
+                background: #37474F; color: #fff; font-size: 11px; padding: 6px;
+                border-radius: 5px;
+            }
+            QPushButton:hover { background: #455A64; }
+        """)
+        self.btn_gen_folder.clicked.connect(self.generate_from_folder)
+        gen_lay.addWidget(self.btn_gen_folder)
+
+        self.lbl_selected_img = QLabel("Select any photo(s) to reconstruct")
+        self.lbl_selected_img.setStyleSheet("color:#666; font-size:10px;")
+        self.lbl_selected_img.setWordWrap(True)
+        gen_lay.addWidget(self.lbl_selected_img)
+
+        lay.addWidget(gen_box)
+        lay.addSpacing(6)
 
         # Mode toggle
         self.mode_btn = QPushButton("Mode: Auto Turntable")
         self.mode_btn.setStyleSheet("background:#333;")
         self.mode_btn.clicked.connect(self.toggle_mode)
         lay.addWidget(self.mode_btn)
-        lay.addSpacing(6)
+        lay.addSpacing(4)
 
         # Images-per-scan spinbox
         img_row = QHBoxLayout()
@@ -546,7 +910,7 @@ class ModernScannerApp(QMainWindow):
         )
         img_row.addWidget(self.spn_images)
         lay.addLayout(img_row)
-        lay.addSpacing(6)
+        lay.addSpacing(4)
 
         # Scan / compile button
         self.btn_action = QPushButton("Execute Hardware Loop")
@@ -559,14 +923,14 @@ class ModernScannerApp(QMainWindow):
         self.btn_capture.setDisabled(True)
         self.btn_capture.clicked.connect(self.capture_manual)
         lay.addWidget(self.btn_capture)
-        lay.addSpacing(6)
+        lay.addSpacing(4)
 
         # Re-process
         self.btn_reprocess = QPushButton("Re-Process Existing Images")
         self.btn_reprocess.setStyleSheet("background:#2e7d32;")
         self.btn_reprocess.clicked.connect(self.reprocess_existing_images)
         lay.addWidget(self.btn_reprocess)
-        lay.addSpacing(6)
+        lay.addSpacing(4)
 
         # Load GLB
         self.btn_load = QPushButton("Load External .GLB Mesh")
@@ -575,12 +939,101 @@ class ModernScannerApp(QMainWindow):
         lay.addWidget(self.btn_load)
         lay.addSpacing(4)
 
-        # Back to Camera (visible when viewer is active)
-        self.btn_back_cam = QPushButton("🔙  Back to Camera")
-        self.btn_back_cam.setStyleSheet("background:#0d47a1;")
+        # View Scanned Model button
+        self.btn_view_model = QPushButton("🌐  View Scanned 3D Model")
+        self.btn_view_model.setStyleSheet("""
+            QPushButton { 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #00838F, stop:1 #00ACC1);
+                color: #fff; font-weight: bold; font-size: 11px; padding: 7px;
+                border-radius: 4px;
+            }
+            QPushButton:hover { background: #26C6DA; }
+        """)
+        self.btn_view_model.setToolTip("Directly load and view the current 3D model in the interactive viewer")
+        self.btn_view_model.clicked.connect(self.view_loaded_model)
+        lay.addWidget(self.btn_view_model)
+        lay.addSpacing(4)
+
+        # ── Export to Blender Section ─────────────────────────────────────────
+        export_box = QGroupBox("📦 Export to Blender")
+        export_box.setStyleSheet("""
+            QGroupBox { 
+                border: 1px solid #FF9800; margin-top:1ex;
+                font-weight:bold; color:#FF9800;
+                padding-top: 14px;
+            }
+        """)
+        exp_lay = QVBoxLayout(export_box)
+
+        btn_row = QHBoxLayout()
+        self.btn_export_fbx = QPushButton("FBX")
+        self.btn_export_fbx.setStyleSheet("background:#E65100; font-size:11px; padding:5px;")
+        self.btn_export_fbx.setToolTip("Export as FBX — best for Blender & animation")
+        self.btn_export_fbx.clicked.connect(lambda: self.export_for_blender("FBX"))
+
+        self.btn_export_obj = QPushButton("OBJ")
+        self.btn_export_obj.setStyleSheet("background:#BF360C; font-size:11px; padding:5px;")
+        self.btn_export_obj.setToolTip("Export as OBJ — universal 3D format")
+        self.btn_export_obj.clicked.connect(lambda: self.export_for_blender("OBJ"))
+
+        self.btn_export_stl = QPushButton("STL")
+        self.btn_export_stl.setStyleSheet("background:#8D6E63; font-size:11px; padding:5px;")
+        self.btn_export_stl.setToolTip("Export as STL — for 3D printing")
+        self.btn_export_stl.clicked.connect(lambda: self.export_for_blender("STL"))
+
+        self.btn_export_glb = QPushButton("GLB")
+        self.btn_export_glb.setStyleSheet("background:#546E7A; font-size:11px; padding:5px;")
+        self.btn_export_glb.setToolTip("Copy GLB to export folder")
+        self.btn_export_glb.clicked.connect(lambda: self.export_for_blender("GLB"))
+
+        self.btn_export_blend = QPushButton("BLEND")
+        self.btn_export_blend.setStyleSheet("background:#F57C00; font-size:11px; padding:5px; font-weight:bold;")
+        self.btn_export_blend.setToolTip("Generate Native Blender .blend Master Scene")
+        self.btn_export_blend.clicked.connect(lambda: self.export_for_blender("BLEND"))
+
+        btn_row.addWidget(self.btn_export_fbx)
+        btn_row.addWidget(self.btn_export_obj)
+        btn_row.addWidget(self.btn_export_stl)
+        btn_row.addWidget(self.btn_export_glb)
+        btn_row.addWidget(self.btn_export_blend)
+        exp_lay.addLayout(btn_row)
+
+        self.btn_open_blender = QPushButton("🚀  Open in Blender 5.2")
+        self.btn_open_blender.setStyleSheet("""
+            QPushButton {
+                background: #D84315; color:#fff; font-size:11px; font-weight:bold;
+                padding:6px; border-radius:4px;
+            }
+            QPushButton:hover { background: #BF360C; }
+        """)
+        self.btn_open_blender.setToolTip("Open the current 3D model directly inside Blender")
+        self.btn_open_blender.clicked.connect(self.open_current_in_blender)
+        exp_lay.addWidget(self.btn_open_blender)
+
+        self.lbl_export_status = QLabel("Load or generate a model first")
+        self.lbl_export_status.setStyleSheet("color:#666; font-size:10px;")
+        self.lbl_export_status.setWordWrap(True)
+        exp_lay.addWidget(self.lbl_export_status)
+
+        lay.addWidget(export_box)
+        lay.addSpacing(4)
+
+        # ── Label Toggle & Back ───────────────────────────────────────────────
+        ctrl_row = QHBoxLayout()
+
+        self.btn_toggle_labels = QPushButton("🏷  Labels: ON")
+        self.btn_toggle_labels.setStyleSheet("background:#37474F; font-size:11px;")
+        self.btn_toggle_labels.clicked.connect(self.toggle_labels)
+        ctrl_row.addWidget(self.btn_toggle_labels)
+
+        self.btn_back_cam = QPushButton("🔙  Camera")
+        self.btn_back_cam.setStyleSheet("background:#0d47a1; font-size:11px;")
         self.btn_back_cam.clicked.connect(self.back_to_camera)
-        lay.addWidget(self.btn_back_cam)
-        lay.addSpacing(10)
+        ctrl_row.addWidget(self.btn_back_cam)
+
+        lay.addLayout(ctrl_row)
+        lay.addSpacing(6)
 
         # Camera controls row
         cam_row = QHBoxLayout()
@@ -597,7 +1050,7 @@ class ModernScannerApp(QMainWindow):
         cam_row.addWidget(self.btn_cam_switch)
         lay.addLayout(cam_row)
         self._refresh_cam_switch_label()
-        lay.addSpacing(10)
+        lay.addSpacing(6)
 
         # Diagnostics
         diag_lbl = QLabel("SYSTEM DIAGNOSTICS")
@@ -768,6 +1221,197 @@ class ModernScannerApp(QMainWindow):
         else:
             self._update_capture_btn_label()
 
+    # ── AI 3D Reconstruction from Photos ─────────────────────────────────
+    @pyqtSlot()
+    def generate_from_image(self):
+        """Pick a single photo and reconstruct 3D model."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Photo for 3D Generation", "",
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp);;All Files (*)"
+        )
+        if not path:
+            return
+
+        self.lbl_selected_img.setText(f"📁 {os.path.basename(path)}")
+        self.log(f"Selected single photo: {path}")
+
+        self._set_gen_buttons_state(False, "⏳ Generating...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self.img_thread = ImageToModelThread(path, SETTINGS, self)
+        self.img_thread.log_msg.connect(self.log)
+        self.img_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.img_thread.scan_complete.connect(self._on_gen_complete)
+        self.img_thread.scan_error.connect(self._on_gen_error)
+        self.img_thread.start()
+
+    @pyqtSlot()
+    def generate_from_multiple_images(self):
+        """Pick multiple perspective photos (front, right, back, left) for multiview reconstruction."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select 2-4 Perspective Photos", "",
+            "Images (*.jpg *.jpeg *.png *.webp *.bmp);;All Files (*)"
+        )
+        if not paths:
+            return
+
+        self.lbl_selected_img.setText(f"📁 {len(paths)} photos selected")
+        self.log(f"Selected {len(paths)} photos for multiview reconstruction.")
+
+        self._set_gen_buttons_state(False, "⏳ Generating Multiview...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self.multi_thread = MultiviewToModelThread(paths, SETTINGS, base_name="multiview_model", parent=self)
+        self.multi_thread.log_msg.connect(self.log)
+        self.multi_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.multi_thread.scan_complete.connect(self._on_gen_complete)
+        self.multi_thread.scan_error.connect(self._on_gen_error)
+        self.multi_thread.start()
+
+    @pyqtSlot()
+    def generate_from_folder(self):
+        """Select a folder of photos for automated multiview reconstruction."""
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder of Photos")
+        if not folder:
+            return
+
+        found = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+            found += _glob.glob(os.path.join(folder, ext))
+            found += _glob.glob(os.path.join(folder, ext.upper()))
+        found = sorted(list(set(found)))
+
+        if not found:
+            QMessageBox.warning(self, "No Photos", f"No supported image files found in '{folder}'.")
+            return
+
+        base_name = os.path.basename(os.path.normpath(folder))
+        self.lbl_selected_img.setText(f"📁 {base_name} ({len(found)} photos)")
+        self.log(f"Found {len(found)} photos in '{folder}'. Starting multiview reconstruction...")
+
+        self._set_gen_buttons_state(False, "⏳ Processing Folder...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+
+        self.multi_thread = MultiviewToModelThread(found, SETTINGS, base_name=base_name, parent=self)
+        self.multi_thread.log_msg.connect(self.log)
+        self.multi_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.multi_thread.scan_complete.connect(self._on_gen_complete)
+        self.multi_thread.scan_error.connect(self._on_gen_error)
+        self.multi_thread.start()
+
+    def _set_gen_buttons_state(self, enabled, status_text=None):
+        self.btn_gen_image.setEnabled(enabled)
+        self.btn_gen_multi.setEnabled(enabled)
+        self.btn_gen_folder.setEnabled(enabled)
+        if enabled:
+            self.btn_gen_image.setText("📸  Single Photo → 3D")
+            self.btn_gen_multi.setText("🖼️  Multiple Photos (Multiview)")
+            self.btn_gen_folder.setText("📁  Folder of Photos → 3D")
+        elif status_text:
+            self.btn_gen_image.setText(status_text)
+
+    @pyqtSlot(str)
+    def _on_gen_complete(self, glb_path):
+        self._set_gen_buttons_state(True)
+        self.progress_bar.setValue(100)
+        self.log("🎉 3D model generation and multi-format conversion complete!")
+        self.show_model(glb_path)
+
+    @pyqtSlot(str)
+    def _on_gen_error(self, err):
+        self._set_gen_buttons_state(True)
+        self.progress_bar.setVisible(False)
+        self.log(f"❌ Generation error: {err}")
+        QMessageBox.critical(self, "Generation Error", err)
+
+    @pyqtSlot()
+    def open_current_in_blender(self):
+        """Open the current model or its .blend master scene in Blender."""
+        if not self._current_model_path or not os.path.exists(self._current_model_path):
+            QMessageBox.warning(self, "No Model", "No 3D model loaded. Generate or load a model first.")
+            return
+
+        export_dir = SETTINGS.get("export_dir", DEFAULT_EXPORT_DIR)
+        base_name = os.path.splitext(os.path.basename(self._current_model_path))[0]
+        blend_path = os.path.join(export_dir, f"{base_name}.blend")
+
+        if not os.path.exists(blend_path):
+            self.log("Creating native Blender master workspace first...")
+            self.export_for_blender("BLEND")
+            return
+
+        self.log(f"🚀 Opening Blender with {blend_path}...")
+        open_in_blender(blend_path)
+
+    # ── Export to Blender ─────────────────────────────────────────────────────
+    @pyqtSlot()
+    def export_for_blender(self, fmt):
+        """Export the current model in the specified format for Blender."""
+        if not self._current_model_path or not os.path.exists(self._current_model_path):
+            QMessageBox.warning(self, "No Model", "No 3D model loaded. Generate or load a model first.")
+            return
+
+        if fmt == "GLB":
+            # Just copy the GLB to exports
+            export_dir = SETTINGS.get("export_dir", DEFAULT_EXPORT_DIR)
+            os.makedirs(export_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(export_dir, f"blender_export_{timestamp}.glb")
+            import shutil
+            shutil.copy2(self._current_model_path, dest)
+            self.log(f"✅ GLB copied to: {dest}")
+            self.lbl_export_status.setText(f"✅ Exported: {os.path.basename(dest)}")
+            self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
+            
+            # Open the folder
+            os.startfile(export_dir)
+            return
+
+        self.log(f"Starting {fmt} export for Blender...")
+        self.lbl_export_status.setText(f"⏳ Exporting {fmt}...")
+        self.lbl_export_status.setStyleSheet("color:#FF9800; font-size:10px;")
+
+        self._export_thread = BlenderExportThread(
+            self._current_model_path, fmt, SETTINGS, self
+        )
+        self._export_thread.log_msg.connect(self.log)
+        self._export_thread.export_done.connect(self._on_export_done)
+        self._export_thread.export_error.connect(self._on_export_error)
+        self._export_thread.start()
+
+    @pyqtSlot(str)
+    def _on_export_done(self, path):
+        self.lbl_export_status.setText(f"✅ {os.path.basename(path)}")
+        self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
+        self.log(f"🎉 Export complete: {path}")
+        
+        # Open the export folder
+        export_dir = os.path.dirname(path)
+        os.startfile(export_dir)
+
+    @pyqtSlot(str)
+    def _on_export_error(self, err):
+        self.lbl_export_status.setText(f"❌ Export failed")
+        self.lbl_export_status.setStyleSheet("color:#F44336; font-size:10px;")
+        self.log(f"❌ Export error: {err}")
+
+    # ── Label Toggle ──────────────────────────────────────────────────────────
+    @pyqtSlot()
+    def toggle_labels(self):
+        self._labels_visible = not self._labels_visible
+        state = "ON" if self._labels_visible else "OFF"
+        self.btn_toggle_labels.setText(f"🏷  Labels: {state}")
+        # Send JS command to toggle labels in the viewer
+        if self.stack.currentIndex() == 1:
+            self.webview.page().runJavaScript(
+                f"if(window.toggleLabels) window.toggleLabels({str(self._labels_visible).lower()});"
+            )
+        self.log(f"Labels: {state}")
+
+    # ── Scan actions ──────────────────────────────────────────────────────────
     @pyqtSlot()
     def start_scan(self):
         self.btn_action.setDisabled(True)
@@ -825,6 +1469,23 @@ class ModernScannerApp(QMainWindow):
             self.show_model(path)
 
     @pyqtSlot()
+    def view_loaded_model(self):
+        target_path = self._current_model_path
+        if not target_path or not os.path.exists(target_path):
+            default_path = os.path.join(APP_DIR, "scanned_object.glb")
+            if os.path.exists(default_path):
+                target_path = default_path
+        if target_path and os.path.exists(target_path):
+            self.show_model(target_path)
+            self.log(f"Displaying 3D model: {os.path.basename(target_path)}")
+        else:
+            self.log("ERROR: No 3D model found to display. Generate or load a model first.")
+
+    # Backwards compatibility alias
+    def view_civis_model(self):
+        self.view_loaded_model()
+
+    @pyqtSlot()
     def back_to_camera(self):
         self.stack.setCurrentIndex(0)
         if self.camera_enabled:
@@ -836,6 +1497,10 @@ class ModernScannerApp(QMainWindow):
     @pyqtSlot(str)
     def show_model(self, glb_path):
         import http.server, urllib.parse
+
+        self._current_model_path = glb_path
+        self.lbl_export_status.setText(f"Ready: {os.path.basename(glb_path)}")
+        self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
 
         # Restart camera if it was auto-paused during Auto Turntable
         if self._cam_auto_paused:
@@ -870,21 +1535,105 @@ class ModernScannerApp(QMainWindow):
 <html>
 <head>
   <meta charset="utf-8">
-  <title>3D Viewer</title>
+  <title>3D Model Viewer — {glb_filename}</title>
   <style>
     * {{ margin:0; padding:0; box-sizing:border-box; }}
-    html, body {{ width:100%; height:100%; background:#1a1a1a; overflow:hidden; }}
+    html, body {{ width:100%; height:100%; background:#0d1117; overflow:hidden; font-family:'Segoe UI',sans-serif; }}
     canvas {{ display:block; width:100%; height:100%; }}
     #info {{
       display:none; position:absolute; inset:0;
       color:#999; font:16px sans-serif;
       justify-content:center; align-items:center; text-align:center;
     }}
+    
+    /* ── 3D Label Styles ── */
+    .label-3d {{
+      position: absolute;
+      pointer-events: none;
+      transform: translate(-50%, -100%);
+      z-index: 100;
+      transition: opacity 0.3s ease;
+    }}
+    .label-3d.hidden {{
+      opacity: 0 !important;
+      pointer-events: none;
+    }}
+    .label-dot {{
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      margin: 0 auto 4px;
+      box-shadow: 0 0 8px currentColor, 0 0 16px currentColor;
+      animation: pulse 2s ease-in-out infinite;
+    }}
+    .label-line {{
+      width: 2px; height: 26px;
+      margin: 0 auto;
+      background: linear-gradient(to bottom, currentColor, transparent);
+    }}
+    .label-card {{
+      background: rgba(13, 17, 23, 0.92);
+      border: 1px solid;
+      border-radius: 8px;
+      padding: 5px 10px;
+      white-space: nowrap;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }}
+    .label-name {{
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }}
+    .label-desc {{
+      font-size: 9px;
+      opacity: 0.8;
+      margin-top: 2px;
+    }}
+    
+    /* ── Header Bar ── */
+    #header {{
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 44px;
+      background: linear-gradient(180deg, rgba(13,17,23,0.95) 0%, rgba(13,17,23,0) 100%);
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      z-index: 200;
+    }}
+    #header h1 {{
+      font-size: 14px;
+      font-weight: 600;
+      color: #00BCD4;
+      letter-spacing: 0.5px;
+    }}
+    #header .dims {{
+      margin-left: auto;
+      font-size: 12px;
+      color: #00E676;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      background: rgba(0, 230, 118, 0.1);
+      padding: 4px 10px;
+      border-radius: 4px;
+      border: 1px solid rgba(0, 230, 118, 0.2);
+    }}
+    
+    @keyframes pulse {{
+      0%, 100% {{ transform: scale(1); opacity:1; }}
+      50% {{ transform: scale(1.4); opacity:0.6; }}
+    }}
   </style>
 </head>
 <body>
+  <div id="header">
+    <h1 id="model-title">{glb_filename}</h1>
+    <span class="dims" id="model-dims">Measuring dimensions…</span>
+  </div>
   <div id="container"></div>
   <div id="info" style="z-index: 9999;"><p>Loading 3D model…</p></div>
+  <div id="labels-container"></div>
 
   <script src="/three.min.js"></script>
   <script src="/OrbitControls.js"></script>
@@ -897,10 +1646,81 @@ class ModernScannerApp(QMainWindow):
     }};
     
     var scene, camera, renderer, controls;
+    var labelElements = [];
+    var labelPositions = [];
+    var labelsVisible = true;
+
+    function createDimensionLabels(box, center, size) {{
+      var container = document.getElementById('labels-container');
+      container.innerHTML = '';
+      labelElements = [];
+      labelPositions = [];
+
+      var wCm = (size.x * 100).toFixed(1);
+      var lCm = (size.y * 100).toFixed(1);
+      var hCm = (size.z * 100).toFixed(1);
+
+      var markers = [
+        {{ name: 'Height (Top)', desc: hCm + ' cm', pos: new THREE.Vector3(center.x, box.max.y, center.z), color: '#00BCD4' }},
+        {{ name: 'Width (X-Span)', desc: wCm + ' cm', pos: new THREE.Vector3(box.max.x, center.y, center.z), color: '#FF9800' }},
+        {{ name: 'Depth (Z-Span)', desc: lCm + ' cm', pos: new THREE.Vector3(center.x, center.y, box.max.z), color: '#4CAF50' }},
+        {{ name: 'Origin Center', desc: 'Anchor Point', pos: center.clone(), color: '#E91E63' }}
+      ];
+
+      markers.forEach(function(m) {{
+        var el = document.createElement('div');
+        el.className = 'label-3d';
+        el.style.color = m.color;
+        el.innerHTML = 
+          '<div class="label-card" style="border-color:' + m.color + '">' +
+            '<div class="label-name" style="color:' + m.color + '">' + m.name + '</div>' +
+            '<div class="label-desc">' + m.desc + '</div>' +
+          '</div>' +
+          '<div class="label-line"></div>' +
+          '<div class="label-dot" style="background:' + m.color + '; color:' + m.color + '"></div>';
+        container.appendChild(el);
+        labelElements.push(el);
+        labelPositions.push(m.pos);
+      }});
+    }}
+
+    function updateLabels() {{
+      if (!camera || !renderer) return;
+      var width = renderer.domElement.clientWidth;
+      var height = renderer.domElement.clientHeight;
+      
+      for (var i = 0; i < labelElements.length; i++) {{
+        var pos = labelPositions[i].clone();
+        pos.project(camera);
+        
+        var x = (pos.x * 0.5 + 0.5) * width;
+        var y = (-pos.y * 0.5 + 0.5) * height;
+        
+        if (pos.z > 1) {{
+          labelElements[i].style.opacity = '0';
+        }} else {{
+          labelElements[i].style.opacity = labelsVisible ? '1' : '0';
+          labelElements[i].style.left = x + 'px';
+          labelElements[i].style.top = y + 'px';
+        }}
+      }}
+    }}
+
+    // Global toggle function callable from Python
+    window.toggleLabels = function(visible) {{
+      labelsVisible = visible;
+      labelElements.forEach(function(el) {{
+        if (visible) {{
+          el.classList.remove('hidden');
+        }} else {{
+          el.classList.add('hidden');
+        }}
+      }});
+    }};
 
     function init() {{
       scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x1a1a1a);
+      scene.background = new THREE.Color(0x0d1117);
 
       camera = new THREE.PerspectiveCamera(
         45, window.innerWidth / window.innerHeight, 0.01, 1000
@@ -913,18 +1733,25 @@ class ModernScannerApp(QMainWindow):
       try {{ renderer.outputEncoding = THREE.sRGBEncoding; }} catch(e) {{}}
       document.getElementById('container').appendChild(renderer.domElement);
 
-      // Lights
-      scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+      // Studio 3-point lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      
       var d1 = new THREE.DirectionalLight(0xffffff, 1.0);
       d1.position.set(5, 10, 7); scene.add(d1);
       var d2 = new THREE.DirectionalLight(0xffffff, 0.5);
       d2.position.set(-5, 5, -7); scene.add(d2);
+      var d3 = new THREE.DirectionalLight(0x00BCD4, 0.3);
+      d3.position.set(0, -3, 5); scene.add(d3);
+
+      // Subtle ground grid
+      var gridHelper = new THREE.GridHelper(4, 20, 0x1a2332, 0x111827);
+      scene.add(gridHelper);
 
       controls = new THREE.OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
       controls.dampingFactor = 0.08;
       controls.autoRotate = true;
-      controls.autoRotateSpeed = 2.0;
+      controls.autoRotateSpeed = 1.5;
 
       var loader = new THREE.GLTFLoader();
       loader.load('/model.glb', function(gltf) {{
@@ -939,6 +1766,19 @@ class ModernScannerApp(QMainWindow):
         camera.position.z += maxDim * 2.5;
         camera.lookAt(center);
         controls.update();
+
+        // Dynamically calculate and display real dimensions in cm
+        var dimsEl = document.getElementById('model-dims');
+        if (dimsEl) {{
+          var wCm = (size.x * 100).toFixed(1);
+          var lCm = (size.y * 100).toFixed(1);
+          var hCm = (size.z * 100).toFixed(1);
+          dimsEl.textContent = wCm + ' × ' + lCm + ' × ' + hCm + ' cm';
+        }}
+
+        // Create bounding measurement annotations
+        createDimensionLabels(box, center, size);
+
       }}, undefined, function(error) {{
         console.error('GLB load error:', error);
         document.getElementById('info').style.display = 'flex';
@@ -957,6 +1797,7 @@ class ModernScannerApp(QMainWindow):
       requestAnimationFrame(animate);
       controls.update();
       renderer.render(scene, camera);
+      updateLabels();
     }}
 
     window.onload = init;

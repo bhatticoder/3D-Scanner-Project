@@ -1,0 +1,6 @@
+PyQt6>=6.0.0
+PyQt6-WebEngine>=6.0.0
+opencv-python>=4.5.0
+requests>=2.25.0
+trimesh>=3.9.0
+pyserial>=3.5

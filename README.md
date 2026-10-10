@@ -239,10 +239,6 @@ To use an automated motorized turntable:
     "num_images": 4,                         // Number of shots for manual capture
     "rotation_step": 10,                     // Degrees per rotation step for turntable
     "camera_index": 1,                       // Camera index (0 = laptop webcam, 1 = external webcam)
-    "students": [                            // Academic attribution (optional)
-        { "name": "Member 1", "roll": "23f-1111" },
-        { "name": "Member 2", "roll": "22f-1111" }
-    ]
 }
 ```
 

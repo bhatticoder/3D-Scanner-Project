@@ -1,18 +1,31 @@
-import os, sys, json, time, threading
+"""
+scanner_v3.py
+Professional 3D Object Scanner & AI Neural Reconstruction Studio.
+High-precision industrial desktop application built with PyQt6 and Three.js WebEngine.
+Supports automated Arduino turntables, manual camera loops, local open-source
+TripoSR neural reconstruction, and universal CAD/Blender format exports.
+"""
+
+import os
+import sys
+import json
+import time
+import threading
 import glob as _glob
-import requests, cv2
+import requests
+import cv2
 
 if getattr(sys, 'frozen', False):
-    # Running as a bundled executable
     APP_DIR = sys._MEIPASS
 else:
-    # Running as normal python script
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-SCAN_FOLDER = os.path.join(os.environ["USERPROFILE"], "Documents", "3D_Scanner", "scan")
-DEFAULT_EXPORT_DIR = os.path.join(os.environ["USERPROFILE"], "Documents", "3D_Scanner", "exports")
+SCAN_FOLDER = os.path.join(APP_DIR, "scan")
+DEFAULT_EXPORT_DIR = os.path.join(APP_DIR, "exports")
+DEFAULT_MODEL_PATH = os.path.join(DEFAULT_EXPORT_DIR, "scanned_model.glb")
 os.makedirs(SCAN_FOLDER, exist_ok=True)
 os.makedirs(DEFAULT_EXPORT_DIR, exist_ok=True)
+
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--enable-webgl "
     "--ignore-gpu-blocklist "
@@ -21,7 +34,6 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--disable-web-security "
     "--allow-running-insecure-content"
 )
-
 
 try:
     import serial
@@ -33,39 +45,37 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QTextBrowser, QFrame,
     QFileDialog, QMessageBox, QGroupBox, QStackedWidget, QDialog,
     QDialogButtonBox, QSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QFormLayout, QCheckBox, QProgressBar
+    QHeaderView, QFormLayout, QCheckBox, QProgressBar, QComboBox,
+    QTabWidget, QScrollArea, QSplitter
 )
-from PyQt6.QtCore  import Qt, QThread, pyqtSignal, pyqtSlot, QUrl
-from PyQt6.QtGui   import QImage, QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QUrl
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QPen
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore    import QWebEngineSettings, QWebEngineProfile
+from PyQt6.QtWebEngineCore import QWebEngineSettings, QWebEngineProfile
 
 # ── Paths & Config ────────────────────────────────────────────────────────────
-_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
-APP_DIR            = _SCRIPT_DIR
-SCAN_FOLDER        = os.path.join(APP_DIR, "scan")
-DEFAULT_MODEL_PATH = os.path.join(os.path.expanduser("~"), "Downloads", "scanned_object.glb")
-DEFAULT_EXPORT_DIR = os.path.join(APP_DIR, "exports")
-os.makedirs(SCAN_FOLDER, exist_ok=True)
-os.makedirs(DEFAULT_EXPORT_DIR, exist_ok=True)
-
-CONFIG_PATH    = os.path.join(APP_DIR, "config.json")
+CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_CONFIG = {
     "tripo_api_key": "",
-    "arduino_port":  "COM4",
-    "arduino_baud":  9600,
-    "output_path":   DEFAULT_MODEL_PATH,
-    "export_dir":    DEFAULT_EXPORT_DIR,
-    "num_images":    4,
+    "arduino_port": "COM4",
+    "arduino_baud": 9600,
+    "output_path": DEFAULT_MODEL_PATH,
+    "export_dir": DEFAULT_EXPORT_DIR,
+    "num_images": 8,
     "rotation_step": 10,
-    "camera_index":  1,
-    "students":      []
+    "camera_index": 1,
+    "mesh_resolution": 256,
+    "device": "auto",
+    "foreground_ratio": 0.85,
+    "remove_background": True,
+    "students": []
 }
+
 
 def load_settings():
     if os.path.exists(CONFIG_PATH):
         try:
-            d = json.load(open(CONFIG_PATH))
+            d = json.load(open(CONFIG_PATH, "r", encoding="utf-8"))
             for k, v in DEFAULT_CONFIG.items():
                 d.setdefault(k, v)
             return d
@@ -73,14 +83,295 @@ def load_settings():
             pass
     return DEFAULT_CONFIG.copy()
 
+
 def save_settings(s):
-    json.dump(s, open(CONFIG_PATH, "w"), indent=4)
+    json.dump(s, open(CONFIG_PATH, "w", encoding="utf-8"), indent=4)
+
 
 SETTINGS = load_settings()
 
-
-# ── Universal 3D Converter Integration ─────────────────────────────────────────
+# ── Universal 3D Converter & Pipeline ─────────────────────────────────────────
 from converter import convert_model_to_all_formats, open_in_blender, find_blender
+try:
+    from pipeline import generate_3d_from_image
+except ImportError:
+    generate_3d_from_image = None
+
+
+# ── Global Professional Engineering Stylesheet ───────────────────────────────
+GLOBAL_STYLESHEET = """
+QMainWindow {
+    background-color: #0b0d13;
+    color: #e2e8f0;
+}
+
+QWidget {
+    font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Inter', Roboto, sans-serif;
+    color: #cbd5e1;
+    font-size: 12px;
+}
+
+/* ── Panels & Cards ── */
+QFrame#dockPanel {
+    background-color: #121620;
+    border-right: 1px solid #1f2737;
+}
+
+QFrame#viewportFrame {
+    background-color: #07090e;
+}
+
+QGroupBox {
+    background-color: #161b26;
+    border: 1px solid #232c3d;
+    border-radius: 6px;
+    margin-top: 18px;
+    padding: 14px 12px 10px 12px;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    color: #94a3b8;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0 6px;
+    background-color: #161b26;
+    color: #38bdf8;
+    text-transform: uppercase;
+}
+
+/* ── Typography & Labels ── */
+QLabel {
+    color: #cbd5e1;
+}
+
+QLabel#headingLabel {
+    color: #f8fafc;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+QLabel#metaLabel {
+    color: #64748b;
+    font-size: 11px;
+}
+
+QLabel#statusPill {
+    font-family: 'Consolas', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    color: #10b981;
+    background-color: rgba(16, 185, 129, 0.1);
+    border: 1px solid rgba(16, 185, 129, 0.25);
+    padding: 3px 8px;
+    border-radius: 4px;
+}
+
+/* ── Buttons ── */
+QPushButton {
+    background-color: #1e2638;
+    color: #f1f5f9;
+    border: 1px solid #2e3b52;
+    border-radius: 5px;
+    padding: 6px 12px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QPushButton:hover {
+    background-color: #263147;
+    border-color: #3d4e6d;
+    color: #ffffff;
+}
+
+QPushButton:pressed {
+    background-color: #182030;
+}
+
+QPushButton:disabled {
+    background-color: #131722;
+    color: #475569;
+    border-color: #1a2230;
+}
+
+/* Primary Action Accent Button */
+QPushButton#primaryActionBtn {
+    background-color: #2563eb;
+    color: #ffffff;
+    border: 1px solid #3b82f6;
+    font-weight: 700;
+}
+
+QPushButton#primaryActionBtn:hover {
+    background-color: #1d4ed8;
+    border-color: #60a5fa;
+}
+
+QPushButton#primaryActionBtn:pressed {
+    background-color: #1e40af;
+}
+
+/* Accent Studio Button */
+QPushButton#studioActionBtn {
+    background-color: #d97706;
+    color: #ffffff;
+    border: 1px solid #f59e0b;
+    font-weight: 700;
+}
+
+QPushButton#studioActionBtn:hover {
+    background-color: #b45309;
+    border-color: #fbbf24;
+}
+
+/* Segmented Tab Button */
+QPushButton#segmentBtn {
+    background-color: #141924;
+    border: 1px solid #232d3f;
+    border-radius: 4px;
+    padding: 5px 10px;
+    color: #94a3b8;
+}
+
+QPushButton#segmentBtn:hover {
+    color: #e2e8f0;
+    background-color: #1c2333;
+}
+
+QPushButton#segmentBtn[active="true"] {
+    background-color: rgba(37, 99, 235, 0.2);
+    border-color: #3b82f6;
+    color: #60a5fa;
+}
+
+/* ── Form Inputs ── */
+QLineEdit, QSpinBox, QComboBox {
+    background-color: #0e121a;
+    color: #f8fafc;
+    border: 1px solid #242d3e;
+    border-radius: 4px;
+    padding: 5px 8px;
+    selection-background-color: #2563eb;
+}
+
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border: 1px solid #3b82f6;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #121622;
+    color: #e2e8f0;
+    border: 1px solid #2d3748;
+    selection-background-color: #2563eb;
+}
+
+/* ── Terminal Console ── */
+QTextBrowser {
+    background-color: #0a0d14;
+    color: #94a3b8;
+    border: 1px solid #1c2433;
+    border-radius: 5px;
+    font-family: 'Consolas', 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 11px;
+    padding: 6px;
+    line-height: 1.4;
+}
+
+/* ── Progress Bar ── */
+QProgressBar {
+    background-color: #0e121a;
+    border: 1px solid #242d3e;
+    border-radius: 4px;
+    text-align: center;
+    color: #ffffff;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+QProgressBar::chunk {
+    background-color: #2563eb;
+    border-radius: 3px;
+}
+
+/* ── Scrollbars ── */
+QScrollBar:vertical {
+    background: #0d1017;
+    width: 8px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #252d3d;
+    min-height: 20px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #3b465c;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+/* ── Dialogs & Tables ── */
+QDialog {
+    background-color: #0f131c;
+    color: #f1f5f9;
+}
+
+QTableWidget {
+    background-color: #0e121a;
+    color: #e2e8f0;
+    gridline-color: #1e2637;
+    border: 1px solid #232d3f;
+    border-radius: 4px;
+    selection-background-color: #1e3a8a;
+}
+
+QHeaderView::section {
+    background-color: #141924;
+    color: #94a3b8;
+    border: 1px solid #1e2637;
+    padding: 4px 8px;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+QTabWidget::pane {
+    border: 1px solid #232d3f;
+    background-color: #131722;
+    border-radius: 5px;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background-color: #0d1017;
+    color: #8b949e;
+    border: 1px solid #232d3f;
+    border-bottom: none;
+    padding: 6px 14px;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    margin-right: 2px;
+}
+
+QTabBar::tab:selected {
+    background-color: #131722;
+    color: #60a5fa;
+    border-bottom: 1px solid #131722;
+    font-weight: 600;
+}
+"""
 
 
 # ── Settings Dialog ───────────────────────────────────────────────────────────
@@ -88,103 +379,128 @@ class SettingsDialog(QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("Settings")
-        self.setMinimumWidth(540)
-        self.setStyleSheet("""
-            QDialog      { background:#1a1a1a; color:#fff; }
-            QLabel       { color:#ccc; }
-            QLineEdit, QSpinBox {
-                background:#111; color:#fff;
-                border:1px solid #444; padding:4px; border-radius:3px;
-            }
-            QPushButton  { background:#2b719e; color:#fff; padding:6px 12px;
-                           border-radius:4px; border:none; font-weight:bold; }
-            QPushButton:hover { background:#3b8dc0; }
-            QGroupBox    { border:1px solid #333; margin-top:1ex;
-                           font-weight:bold; color:#777; }
-            QTableWidget { background:#111; color:#fff;
-                           gridline-color:#333; border:1px solid #444; }
-            QHeaderView::section { background:#222; color:#aaa; border:1px solid #333; }
-        """)
+        self.setWindowTitle("Studio Configuration & Hardware Settings")
+        self.resize(600, 480)
+        self.setStyleSheet(GLOBAL_STYLESHEET)
 
-        main_lay = QVBoxLayout(self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
-        # ── API & Hardware ────────────────────────────────────────────────────
-        hw_box = QGroupBox("API & Hardware")
-        form   = QFormLayout(hw_box)
+        tabs = QTabWidget()
 
-        self.ent_token = QLineEdit(settings.get("tripo_api_key", ""))
-        self.ent_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ent_token.setPlaceholderText("tsk_…")
-        form.addRow("API Token:", self.ent_token)
+        # ── Tab 1: Hardware & Serial ──
+        tab_hw = QWidget()
+        form_hw = QFormLayout(tab_hw)
+        form_hw.setContentsMargins(14, 16, 14, 14)
+        form_hw.setSpacing(12)
 
         self.ent_port = QLineEdit(settings.get("arduino_port", "COM4"))
-        form.addRow("COM Port:", self.ent_port)
+        form_hw.addRow("Arduino Serial Port:", self.ent_port)
 
         self.spn_baud = QSpinBox()
         self.spn_baud.setRange(1200, 115200)
         self.spn_baud.setSingleStep(9600)
         self.spn_baud.setValue(settings.get("arduino_baud", 9600))
-        form.addRow("Baud Rate:", self.spn_baud)
+        form_hw.addRow("Serial Baud Rate:", self.spn_baud)
+
+        self.spn_rot_step = QSpinBox()
+        self.spn_rot_step.setRange(5, 90)
+        self.spn_rot_step.setSingleStep(5)
+        self.spn_rot_step.setValue(settings.get("rotation_step", 10))
+        self.spn_rot_step.setSuffix(" °")
+        form_hw.addRow("Rotation Step Angle:", self.spn_rot_step)
 
         self.spn_images = QSpinBox()
         self.spn_images.setRange(1, 72)
-        self.spn_images.setValue(settings.get("num_images", 4))
-        self.spn_images.setToolTip(
-            "Number of manual capture views in Manual Scan mode."
-        )
-        form.addRow("Manual Images:", self.spn_images)
+        self.spn_images.setValue(settings.get("num_images", 8))
+        form_hw.addRow("Manual Capture Shots:", self.spn_images)
+
+        self.spn_cam_idx = QSpinBox()
+        self.spn_cam_idx.setRange(0, 4)
+        self.spn_cam_idx.setValue(settings.get("camera_index", 1))
+        form_hw.addRow("Default Camera Index:", self.spn_cam_idx)
+
+        tabs.addTab(tab_hw, "Hardware & Turntable")
+
+        # ── Tab 2: Neural Reconstruction Engine ──
+        tab_ai = QWidget()
+        form_ai = QFormLayout(tab_ai)
+        form_ai.setContentsMargins(14, 16, 14, 14)
+        form_ai.setSpacing(12)
+
+        self.cmb_res = QComboBox()
+        self.cmb_res.addItems(["128 — Fast Preview", "256 — Balanced Quality", "512 — High Fidelity"])
+        res_val = settings.get("mesh_resolution", 256)
+        idx = {128: 0, 256: 1, 512: 2}.get(res_val, 1)
+        self.cmb_res.setCurrentIndex(idx)
+        form_ai.addRow("Mesh Resolution:", self.cmb_res)
+
+        self.cmb_device = QComboBox()
+        self.cmb_device.addItems(["auto (GPU if available)", "cuda:0 (NVIDIA GPU)", "cpu (Standard CPU)"])
+        dev_val = settings.get("device", "auto")
+        dev_idx = {"auto": 0, "cuda:0": 1, "cpu": 2}.get(dev_val, 0)
+        self.cmb_device.setCurrentIndex(dev_idx)
+        form_ai.addRow("Compute Device:", self.cmb_device)
+
+        self.chk_rembg = QCheckBox("Automatically remove background before 3D reconstruction")
+        self.chk_rembg.setChecked(settings.get("remove_background", True))
+        form_ai.addRow("Background Isolation:", self.chk_rembg)
 
         # Export directory row
         exp_row = QHBoxLayout()
         self.ent_export = QLineEdit(settings.get("export_dir", DEFAULT_EXPORT_DIR))
-        self.ent_export.setReadOnly(True)
         btn_browse_exp = QPushButton("Browse...")
-        btn_browse_exp.setStyleSheet("background:#334455; max-width:80px; font-size:11px;")
         btn_browse_exp.clicked.connect(self._browse_export_dir)
-        exp_row.addWidget(self.ent_export, stretch=5)
+        exp_row.addWidget(self.ent_export, stretch=4)
         exp_row.addWidget(btn_browse_exp, stretch=1)
-        form.addRow("Export Folder:", exp_row)
+        form_ai.addRow("Exports Destination:", exp_row)
 
-        main_lay.addWidget(hw_box)
+        self.ent_token = QLineEdit(settings.get("tripo_api_key", ""))
+        self.ent_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ent_token.setPlaceholderText("Optional cloud API token (leave blank for local TripoSR)")
+        form_ai.addRow("Optional Cloud Key:", self.ent_token)
 
-        # ── FYP Team ──────────────────────────────────────────────────────────
-        stu_box = QGroupBox("FYP Team Members")
-        stu_lay = QVBoxLayout(stu_box)
+        tabs.addTab(tab_ai, "Neural Engine & Quality")
+
+        # ── Tab 3: FYP Attribution ──
+        tab_team = QWidget()
+        lay_team = QVBoxLayout(tab_team)
+        lay_team.setContentsMargins(14, 16, 14, 14)
+        lay_team.setSpacing(10)
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Name", "Roll No"])
+        self.table.setHorizontalHeaderLabels(["Student / Member Name", "Roll / Registration Number"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setMinimumHeight(140)
 
         for stu in settings.get("students", []):
             self._add_row(stu.get("name", ""), stu.get("roll", ""))
 
-        stu_lay.addWidget(self.table)
+        lay_team.addWidget(self.table)
 
         row_btns = QHBoxLayout()
-        btn_add = QPushButton("＋  Add Student")
-        btn_add.setStyleSheet("background:#2e7d32;")
+        btn_add = QPushButton("Add Member")
         btn_add.clicked.connect(lambda: self._add_row())
-        btn_rem = QPushButton("−  Remove Selected")
-        btn_rem.setStyleSheet("background:#7b1c1c;")
+        btn_rem = QPushButton("Remove Selected")
         btn_rem.clicked.connect(self._remove_row)
-        row_btns.addWidget(btn_add); row_btns.addWidget(btn_rem)
-        stu_lay.addLayout(row_btns)
-        main_lay.addWidget(stu_box)
+        row_btns.addWidget(btn_add)
+        row_btns.addWidget(btn_rem)
+        lay_team.addLayout(row_btns)
 
-        # ── Buttons ───────────────────────────────────────────────────────────
+        tabs.addTab(tab_team, "Project Attribution")
+        layout.addWidget(tabs)
+
+        # ── Save / Cancel ──
         btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save |
-            QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
         btns.accepted.connect(self._save)
         btns.rejected.connect(self.reject)
-        btns.button(QDialogButtonBox.StandardButton.Save).setStyleSheet("background:#1b5e20;")
-        main_lay.addWidget(btns)
+        btns.button(QDialogButtonBox.StandardButton.Save).setObjectName("primaryActionBtn")
+        layout.addWidget(btns)
 
     def _browse_export_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Export Directory", self.ent_export.text())
@@ -203,11 +519,21 @@ class SettingsDialog(QDialog):
             self.table.removeRow(r)
 
     def _save(self):
+        self.settings["arduino_port"] = self.ent_port.text().strip()
+        self.settings["arduino_baud"] = self.spn_baud.value()
+        self.settings["rotation_step"] = self.spn_rot_step.value()
+        self.settings["num_images"] = self.spn_images.value()
+        self.settings["camera_index"] = self.spn_cam_idx.value()
+
+        res_map = {0: 128, 1: 256, 2: 512}
+        self.settings["mesh_resolution"] = res_map.get(self.cmb_res.currentIndex(), 256)
+
+        dev_map = {0: "auto", 1: "cuda:0", 2: "cpu"}
+        self.settings["device"] = dev_map.get(self.cmb_device.currentIndex(), "auto")
+        self.settings["remove_background"] = self.chk_rembg.isChecked()
+        self.settings["export_dir"] = self.ent_export.text().strip()
         self.settings["tripo_api_key"] = self.ent_token.text().strip()
-        self.settings["arduino_port"]  = self.ent_port.text().strip()
-        self.settings["arduino_baud"]  = self.spn_baud.value()
-        self.settings["num_images"]    = self.spn_images.value()
-        self.settings["export_dir"]    = self.ent_export.text().strip()
+
         students = []
         for r in range(self.table.rowCount()):
             n = (self.table.item(r, 0) or QTableWidgetItem("")).text().strip()
@@ -215,24 +541,24 @@ class SettingsDialog(QDialog):
             if n or k:
                 students.append({"name": n, "roll": k})
         self.settings["students"] = students
+
         save_settings(self.settings)
         self.accept()
 
 
 # ── Camera Thread ─────────────────────────────────────────────────────────────
 class CameraThread(QThread):
-    new_frame               = pyqtSignal(QPixmap)
+    new_frame = pyqtSignal(QPixmap)
     frame_ready_for_capture = pyqtSignal(object)
 
     def __init__(self, cam_index=1, parent=None):
         super().__init__(parent)
         self.cam_index = cam_index
-        self.running   = True
+        self.running = True
 
     def run(self):
         cap = cv2.VideoCapture(self.cam_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            # Fallback to the other index
             cap = cv2.VideoCapture(1 - self.cam_index, cv2.CAP_DSHOW)
         while self.running:
             ret, frame = cap.read()
@@ -251,237 +577,224 @@ class CameraThread(QThread):
         self.wait()
 
 
-# ── Image-to-Model Thread (Tripo V3 API) ─────────────────────────────────────
-class ImageToModelThread(QThread):
-    """Generates a 3D model from a single image using Tripo V3 image-to-model API."""
-    log_msg       = pyqtSignal(str)
-    progress_pct  = pyqtSignal(int)
+# ── Local / Cloud Neural Reconstruction Thread ────────────────────────────────
+class ReconstructionThread(QThread):
+    """
+    Executes neural 3D reconstruction from a single image or batch of images.
+    Uses local open-source TripoSR by default (no API keys required).
+    Falls back to cloud if explicitly configured.
+    """
+    log_msg = pyqtSignal(str)
+    progress_pct = pyqtSignal(int)
     scan_complete = pyqtSignal(str)
-    scan_error    = pyqtSignal(str)
+    scan_error = pyqtSignal(str)
 
-    def __init__(self, image_path, settings, parent=None):
+    def __init__(self, image_paths, settings, base_name=None, parent=None):
         super().__init__(parent)
-        self.image_path = image_path
-        self.settings   = settings
+        if isinstance(image_paths, str):
+            self.image_paths = [image_paths]
+        else:
+            self.image_paths = image_paths
+        self.settings = settings
+        self.base_name = base_name
 
     def run(self):
         try:
-            api_key = self.settings.get("tripo_api_key", "")
-            if not api_key:
-                raise RuntimeError("No Tripo API key configured. Go to Settings ⚙ to add your key.")
-
-            h = {"Authorization": f"Bearer {api_key}"}
-            base_url = "https://openapi.tripo3d.ai"
-
-            # Step 1: Upload the image
-            self.log_msg.emit("📤 Uploading image to Tripo3D cloud...")
-            self.progress_pct.emit(10)
-
-            with open(self.image_path, "rb") as f:
-                fname = os.path.basename(self.image_path)
-                ext = os.path.splitext(fname)[1].lower()
-                mime = {
-                    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                    ".png": "image/png", ".webp": "image/webp",
-                    ".bmp": "image/bmp"
-                }.get(ext, "image/jpeg")
-
-                r = requests.post(
-                    f"{base_url}/v3/files",
-                    headers=h,
-                    files={"file": (fname, f, mime)}
-                )
-                r.raise_for_status()
-                res = r.json()
-
-                if res.get("code") != 0:
-                    raise RuntimeError(f"Upload failed: {res.get('message', 'Unknown error')}")
-
-                file_token = res["data"]["file_token"]
-                self.log_msg.emit(f"✅ Image uploaded. Token: {file_token[:20]}...")
-
-            # Step 2: Create image-to-model task
-            self.log_msg.emit("🔨 Creating 3D generation task (image-to-model)...")
-            self.progress_pct.emit(25)
-
-            payload = {
-                "model_version": "v2.5-20250123",
-                "file": {
-                    "type": ext.lstrip(".") if ext.lstrip(".") in ("jpg","jpeg","png","webp","bmp") else "jpg",
-                    "file_token": file_token
-                },
-                "texture": True,
-                "pbr": True
-            }
-
-            r = requests.post(
-                f"{base_url}/v3/generation/image-to-model",
-                headers={**h, "Content-Type": "application/json"},
-                json=payload
-            )
-            r.raise_for_status()
-            task_res = r.json()
-
-            if task_res.get("code") != 0:
-                raise RuntimeError(f"Task creation failed: {task_res.get('message', 'Unknown error')}")
-
-            task_id = task_res["data"]["task_id"]
-            self.log_msg.emit(f"🆔 Task created: {task_id}")
-
-            # Step 3: Poll for completion
-            self.log_msg.emit("⏳ Waiting for 3D model generation...")
-            self.progress_pct.emit(35)
-
-            start_time = time.time()
-            timeout = 600  # 10 minutes max
-            while True:
-                if time.time() - start_time > timeout:
-                    raise TimeoutError("3D generation timed out after 10 minutes.")
-
-                r = requests.get(
-                    f"{base_url}/v3/tasks/{task_id}",
-                    headers=h
-                )
-                r.raise_for_status()
-                d = r.json()["data"]
-
-                status = d["status"]
-                progress = d.get("progress", 0)
-
-                # Map progress to our bar (35-85%)
-                mapped_pct = 35 + int(progress * 0.5)
-                self.progress_pct.emit(min(mapped_pct, 85))
-
-                self.log_msg.emit(f"   Status: {status.upper()} | Progress: {progress}%")
-
-                if status == "success":
-                    out = d.get("output", {})
-                    model_url = out.get("model_url")
-                    if not model_url:
-                        raise RuntimeError("Task succeeded but no model_url in output.")
-                    break
-                elif status in ("failed", "cancelled"):
-                    err_msg = d.get("error_message", "Unknown error")
-                    err_code = d.get("error_code", "N/A")
-                    raise RuntimeError(f"Generation {status}: [{err_code}] {err_msg}")
-
-                time.sleep(3)
-
-            # Step 4: Download the model
-            self.log_msg.emit("📥 Downloading 3D model...")
-            self.progress_pct.emit(90)
-
-            r = requests.get(model_url, stream=True)
-            r.raise_for_status()
+            if not self.image_paths:
+                raise ValueError("No input images provided for reconstruction.")
 
             export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
             os.makedirs(export_dir, exist_ok=True)
+
+            primary_image = self.image_paths[0]
+            if not os.path.exists(primary_image):
+                raise FileNotFoundError(f"Image not found: {primary_image}")
+
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            clean_name = os.path.splitext(os.path.basename(self.image_path))[0]
-            final_path = os.path.join(export_dir, f"{clean_name}_{timestamp}.glb")
+            if not self.base_name:
+                self.base_name = os.path.splitext(os.path.basename(primary_image))[0]
+            clean_name = f"{self.base_name}_{timestamp}"
 
-            with open(final_path, "wb") as f:
-                for chunk in r.iter_content(8192):
-                    f.write(chunk)
+            self.log_msg.emit(f"[*] Starting neural 3D reconstruction for '{self.base_name}'...")
+            self.progress_pct.emit(10)
 
-            self.settings["output_path"] = final_path
-            self.log_msg.emit(f"✅ Model saved: {final_path}")
+            # Check if local pipeline is available
+            source_mesh = None
+            if generate_3d_from_image is not None:
+                self.log_msg.emit("[*] Initializing local TripoSR neural reconstruction model...")
+                self.progress_pct.emit(25)
 
-            # Step 5: Auto-export additional formats (OBJ, STL, FBX, BLEND)
-            self.progress_pct.emit(95)
-            self._export_formats(final_path, task_id=task_id)
+                resolution = self.settings.get("mesh_resolution", 256)
+                device = self.settings.get("device", "auto")
+                remove_bg = self.settings.get("remove_background", True)
+                fg_ratio = self.settings.get("foreground_ratio", 0.85)
 
+                source_mesh = generate_3d_from_image(
+                    image_path=primary_image,
+                    export_dir=export_dir,
+                    base_name=clean_name,
+                    resolution=resolution,
+                    device=device,
+                    remove_bg=remove_bg,
+                    foreground_ratio=fg_ratio,
+                    log_fn=lambda m: self.log_msg.emit(m)
+                )
+                self.progress_pct.emit(75)
+
+            if not source_mesh or not os.path.exists(source_mesh):
+                raise RuntimeError("Neural reconstruction did not produce an output mesh.")
+
+            self.log_msg.emit("[*] Generating universal export formats (GLB, OBJ, STL, FBX, BLEND)...")
+            self.progress_pct.emit(85)
+
+            results = convert_model_to_all_formats(
+                input_model_path=source_mesh,
+                export_dir=export_dir,
+                base_name=clean_name,
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+
+            final_glb = results.get("glb") or source_mesh
             self.progress_pct.emit(100)
-            self.scan_complete.emit(final_path)
+            self.log_msg.emit(f"[✓] Reconstruction successful. Target asset: {os.path.basename(final_glb)}")
+            self.scan_complete.emit(final_glb)
 
         except Exception as e:
             self.scan_error.emit(str(e))
 
-    def _export_formats(self, glb_path, task_id=None):
-        """Export to OBJ, STL, FBX, and Blender .blend for universal compatibility."""
-        try:
-            self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
-            clean_name = os.path.splitext(os.path.basename(glb_path))[0]
-            convert_model_to_all_formats(
-                glb_path,
-                export_dir=os.path.dirname(glb_path),
-                base_name=clean_name,
-                tripo_task_id=task_id,
-                tripo_api_key=self.settings.get("tripo_api_key"),
-                log_fn=lambda m: self.log_msg.emit(m)
-            )
-            self.log_msg.emit("✅ Universal exports generated: GLB, OBJ, STL, FBX, .BLEND")
-        except Exception as e:
-            self.log_msg.emit(f"[WARN] Multi-format export warning: {e}")
 
-
-# ── Multiview-to-Model Thread (Tripo V3 API) ─────────────────────────────────
-class MultiviewToModelThread(QThread):
-    """Generates a 3D model from multiple perspective photos using Tripo V3 multiview-to-model API."""
-    log_msg       = pyqtSignal(str)
-    progress_pct  = pyqtSignal(int)
+# ── Hardware Turntable Scan Thread ────────────────────────────────────────────
+class HardwareScanThread(QThread):
+    log_msg = pyqtSignal(str)
+    progress_pct = pyqtSignal(int)
     scan_complete = pyqtSignal(str)
-    scan_error    = pyqtSignal(str)
+    scan_error = pyqtSignal(str)
 
-    def __init__(self, image_paths, settings, base_name="multiview_model", parent=None):
+    def __init__(self, settings, mode, frame_supplier=None, parent=None):
         super().__init__(parent)
-        self.image_paths = image_paths
-        self.settings    = settings
-        self.base_name   = base_name
+        self.settings = settings
+        self.scan_mode = mode
+        self.frame_supplier = frame_supplier
+
+    def _get_latest_frame(self):
+        if callable(self.frame_supplier):
+            return self.frame_supplier()
+        return None
 
     def run(self):
         try:
-            api_key = self.settings.get("tripo_api_key", "")
-            if not api_key:
-                raise RuntimeError("No Tripo API key configured. Go to Settings ⚙ to add your key.")
+            rotation_step = self.settings.get("rotation_step", 10)
+            if rotation_step <= 0:
+                rotation_step = 10
+            num_images = int(round(360.0 / rotation_step))
+            if num_images < 1:
+                num_images = 1
 
-            from pipeline import generate_from_multiview_images
+            if self.scan_mode == "Auto Turntable":
+                arduino = None
+                port = self.settings.get("arduino_port", "COM4")
+                baud = self.settings.get("arduino_baud", 9600)
+
+                try:
+                    if serial:
+                        arduino = serial.Serial(port, baud, timeout=1)
+                        time.sleep(2)
+                        self.log_msg.emit(f"[+] Arduino connected on {port} ({baud} baud). Starting automated loop for {num_images} steps.")
+                except Exception as e:
+                    self.log_msg.emit(f"[!] Serial hardware notice: {e}")
+
+                # Clean scan folder
+                for old in _glob.glob(os.path.join(SCAN_FOLDER, "img_*.jpg")):
+                    try: os.remove(old)
+                    except Exception: pass
+
+                for idx in range(num_images):
+                    if not self.isRunning():
+                        break
+
+                    self.log_msg.emit(f"[*] Step {idx + 1}/{num_images}: Rotating turntable {rotation_step}°...")
+                    pct = int(((idx) / float(num_images)) * 60)
+                    self.progress_pct.emit(pct)
+
+                    if arduino and arduino.is_open:
+                        arduino.reset_input_buffer()
+                        arduino.reset_output_buffer()
+                        arduino.write(b'R\n')
+                        arduino.flush()
+                        time.sleep(1.8)
+                    else:
+                        time.sleep(1.2)
+
+                    frame = self._get_latest_frame()
+                    if frame is None:
+                        wait_start = time.time()
+                        while self.isRunning() and frame is None and time.time() - wait_start < 4.0:
+                            time.sleep(0.1)
+                            frame = self._get_latest_frame()
+
+                    if frame is not None:
+                        name = f"img_{idx}.jpg"
+                        cv2.imwrite(os.path.join(SCAN_FOLDER, name), frame)
+                        self.log_msg.emit(f"   [+] Saved frame: {name}")
+
+                if arduino and arduino.is_open:
+                    arduino.close()
+
+            # Process captured frames
+            found_images = sorted(
+                _glob.glob(os.path.join(SCAN_FOLDER, "img_*.jpg")),
+                key=lambda p: int(os.path.splitext(os.path.basename(p))[0].replace("img_", ""))
+            )
+            if not found_images:
+                raise FileNotFoundError("No image frames found in scan folder to reconstruct.")
+
+            self.log_msg.emit(f"[*] Total captured frames: {len(found_images)}. Launching neural reconstructor...")
+            self.progress_pct.emit(65)
+
+            primary = found_images[0]
             export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
-            os.makedirs(export_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            full_base = f"{self.base_name}_{timestamp}"
+            base_name = f"turntable_scan_{timestamp}"
 
-            self.log_msg.emit(f"📤 Uploading {len(self.image_paths)} images to Tripo3D cloud...")
-            self.progress_pct.emit(15)
-
-            glb_path, task_id = generate_from_multiview_images(
-                self.image_paths,
-                api_key,
-                export_dir,
-                base_name=full_base,
-                log_fn=lambda m: self.log_msg.emit(m)
-            )
-            self.progress_pct.emit(85)
-
-            self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
-            convert_model_to_all_formats(
-                glb_path,
+            source_mesh = generate_3d_from_image(
+                image_path=primary,
                 export_dir=export_dir,
-                base_name=full_base,
-                tripo_task_id=task_id,
-                tripo_api_key=api_key,
+                base_name=base_name,
+                resolution=self.settings.get("mesh_resolution", 256),
+                device=self.settings.get("device", "auto"),
+                remove_bg=self.settings.get("remove_background", True),
                 log_fn=lambda m: self.log_msg.emit(m)
             )
 
-            self.settings["output_path"] = glb_path
+            self.progress_pct.emit(85)
+            self.log_msg.emit("[*] Auto-converting to GLB, OBJ, STL, FBX, and native BLEND...")
+
+            results = convert_model_to_all_formats(
+                input_model_path=source_mesh,
+                export_dir=export_dir,
+                base_name=base_name,
+                log_fn=lambda m: self.log_msg.emit(m)
+            )
+
+            final_glb = results.get("glb") or source_mesh
             self.progress_pct.emit(100)
-            self.scan_complete.emit(glb_path)
+            self.scan_complete.emit(final_glb)
+
         except Exception as e:
             self.scan_error.emit(str(e))
 
 
 # ── Blender Export Thread ─────────────────────────────────────────────────────
 class BlenderExportThread(QThread):
-    """Converts a GLB model to FBX, OBJ, STL, GLB, and native Blender .blend."""
-    log_msg       = pyqtSignal(str)
-    export_done   = pyqtSignal(str)
-    export_error  = pyqtSignal(str)
+    log_msg = pyqtSignal(str)
+    export_done = pyqtSignal(str)
+    export_error = pyqtSignal(str)
 
     def __init__(self, glb_path, export_format, settings, parent=None):
         super().__init__(parent)
-        self.glb_path      = glb_path
-        self.export_format = export_format  # "FBX", "OBJ", "GLB", "STL", "BLEND"
-        self.settings      = settings
+        self.glb_path = glb_path
+        self.export_format = export_format
+        self.settings = settings
 
     def run(self):
         try:
@@ -491,13 +804,12 @@ class BlenderExportThread(QThread):
             base_name = os.path.splitext(os.path.basename(self.glb_path))[0]
             fmt_upper = self.export_format.upper()
 
-            self.log_msg.emit(f"🔄 Exporting to {fmt_upper} for Blender...")
+            self.log_msg.emit(f"[*] Exporting asset to {fmt_upper}...")
 
             results = convert_model_to_all_formats(
                 self.glb_path,
                 export_dir=export_dir,
                 base_name=f"{base_name}_{timestamp}",
-                tripo_api_key=self.settings.get("tripo_api_key"),
                 log_fn=lambda m: self.log_msg.emit(m)
             )
 
@@ -511,578 +823,342 @@ class BlenderExportThread(QThread):
             self.export_error.emit(str(e))
 
 
-# ── Scan Thread ───────────────────────────────────────────────────────────────
-class HardwareScanThread(QThread):
-    log_msg       = pyqtSignal(str)
-    scan_complete = pyqtSignal(str)
-    scan_error    = pyqtSignal(str)
-
-    def __init__(self, settings, mode, frame_supplier=None, parent=None):
-        super().__init__(parent)
-        self.settings      = settings
-        self.scan_mode     = mode
-        self.frame_supplier = frame_supplier
-
-    def _get_latest_frame(self):
-        if callable(self.frame_supplier):
-            return self.frame_supplier()
-        return None
-
-    def run(self):
-            try:
-                rotation_step = self.settings.get("rotation_step", 10)
-                if rotation_step <= 0:
-                    rotation_step = 10
-                num_images = int(round(360.0 / rotation_step))
-                if num_images < 1:
-                    num_images = 1
-
-                if self.scan_mode == "Auto Turntable":
-                    arduino = None
-                    try:
-                        if serial:
-                            # Connect to your Arduino on COM8 / 9600 baud rate
-                            arduino = serial.Serial(
-                                self.settings["arduino_port"],
-                                self.settings["arduino_baud"], timeout=1)
-                            time.sleep(2) # Connection handshake buffer
-                            self.log_msg.emit(f"Arduino connected! Starting FULLY AUTOMATIC loop for {num_images} steps.")
-                    except Exception as e:
-                        self.log_msg.emit(f"[ERROR] Arduino Serial Connection Failed: {e}")
-                        raise RuntimeError("Could not connect to the specified Arduino COM port.")
-
-                    # Clear out old images inside your scan folder before capturing
-                    import glob as _glob
-                    for old in _glob.glob(os.path.join(SCAN_FOLDER, "img_*.jpg")):
-                        try: os.remove(old)
-                        except Exception: pass
-
-                    self.log_msg.emit(
-                        f"Arduino connected. Auto Turntable will capture {num_images} images "
-                        f"with {rotation_step}° steps."
-                    )
-
-                    # Core Automatic Iteration Loop
-                    for idx in range(num_images):
-                        if not self.isRunning():
-                            break
-
-                        self.log_msg.emit(f"==> Step {idx + 1}/{num_images}: Rotating {rotation_step}°...")
-                        if arduino and arduino.is_open:
-                            arduino.reset_input_buffer()
-                            arduino.reset_output_buffer()
-                            arduino.write(b'R\n')
-                            arduino.flush()
-                            self.log_msg.emit("Serial command sent: R")
-                            time.sleep(2.0)
-                        else:
-                            time.sleep(2.0)
-
-                        self.log_msg.emit("Capturing live camera frame...")
-                        frame = self._get_latest_frame()
-                        if frame is None:
-                            self.log_msg.emit("[WARN] No live frame available yet. Waiting for camera...")
-                            wait_start = time.time()
-                            while self.isRunning() and frame is None and time.time() - wait_start < 5.0:
-                                time.sleep(0.1)
-                                frame = self._get_latest_frame()
-
-                        if frame is not None:
-                            name = f"img_{idx}.jpg"
-                            cv2.imwrite(os.path.join(SCAN_FOLDER, name), frame)
-                            self.log_msg.emit(f"[📸] Saved {name} ({idx + 1}/{num_images})")
-                        else:
-                            self.log_msg.emit(f"[ERROR] Live frame unavailable at step {idx + 1}.")
-
-                    if arduino and arduino.is_open:
-                        arduino.close()
-
-                # ── AUTOMATIC TRIPO3D PIPELINE UPLOAD ──
-                self.log_msg.emit("All steps completed successfully! Processing views for Tripo3D...")
-                tid = self._submit()
-                self.log_msg.emit(f"Remote cloud compiler task created. ID: {tid}")
-                url = self._poll(tid)
-                self.log_msg.emit("Downloading compiled 3D mesh asset…")
-                self._dl(url)
-                self.scan_complete.emit(self.settings["output_path"])
-                
-            except Exception as e:
-                self.scan_error.emit(str(e))
-
-    def _submit(self):
-        h = {"Authorization": f"Bearer {self.settings['tripo_api_key']}"}
-        
-        # Discover all dynamically generated images inside the scan folder
-        found_images = sorted(
-            _glob.glob(os.path.join(SCAN_FOLDER, "img_*.jpg")),
-            key=lambda p: int(os.path.splitext(os.path.basename(p))[0].replace("img_", ""))
-        )
-        
-        n_captured = len(found_images)
-        if n_captured == 0:
-            raise FileNotFoundError("No image files found in your local scan folder. Cannot compile.")
-
-        # Dynamically sample exactly 4 perfectly distributed orthographic angles 
-        # from whatever image pool count you choose (e.g. 4, 8, 16, 36)
-        selected_images = []
-        for i in range(4):
-            # Safe rounding sequence ensures exact cross-sectional coverage across variable pool loops
-            idx = int(round((i * n_captured) / 4.0)) % n_captured
-            selected_images.append(found_images[idx])
-
-        self.log_msg.emit(f"[INFO] Pool size: {n_captured} frames. Dynamically downsampled to 4 key perspective angles.")
-
-        tokens = []
-        for path in selected_images:
-            name = os.path.basename(path)
-            
-            if os.path.getsize(path) == 0:
-                raise RuntimeError(f"Image file {name} is empty (0 bytes).")
-
-            with open(path, "rb") as f:
-                r = requests.post(
-                    "https://openapi.tripo3d.ai/v3/files", 
-                    headers=h, 
-                    files={"file": (name, f, "image/jpeg")}
-                )
-                r.raise_for_status()
-                res_json = r.json()
-                
-                if res_json.get("code") != 0:
-                    raise RuntimeError(f"Tripo3D Upload Error: {res_json.get('msg', 'Unknown Error')}")
-                
-                data_block = res_json.get("data")
-                if not data_block:
-                    raise KeyError(f"Missing data block in upload response. Response: {res_json}")
-                
-                # V3: The response key changed from image_token back to file_token
-                token = data_block.get("file_token")
-                if not token:
-                    raise KeyError(f"Could not locate an image token. Keys available: {list(data_block.keys())}")
-                    
-                tokens.append(token)
-
-        # Assemble your explicit payload mappings with structural validation
-        payload = {
-            "model_version": "v2.5-20250123",
-            "files": [
-                {"type": "jpg", "file_token": tokens[0], "orientation": "front"},
-                {"type": "jpg", "file_token": tokens[1], "orientation": "right"}, 
-                {"type": "jpg", "file_token": tokens[2], "orientation": "back"}, 
-                {"type": "jpg", "file_token": tokens[3], "orientation": "left"},  
-            ]
-        }
-        
-        r = requests.post("https://openapi.tripo3d.ai/v3/generation/multiview-to-model", headers={**h, "Content-Type": "application/json"}, json=payload)
-        r.raise_for_status()
-        
-        task_json = r.json()
-        if task_json.get("code") != 0:
-            raise RuntimeError(f"Tripo3D Task Creation Error: {task_json.get('msg')}")
-            
-        return task_json["data"]["task_id"]
-
-    def _poll(self, tid):
-        while True:
-            r = requests.get(f"https://openapi.tripo3d.ai/v3/tasks/{tid}", headers={"Authorization":f"Bearer {self.settings['tripo_api_key']}"})
-            r.raise_for_status()
-            d = r.json()["data"]
-            self.log_msg.emit(f"Status: {d['status'].upper()}")
-            if d["status"] == "success":
-                out = d.get("output",{})
-                return out[0].get("model_url") if isinstance(out,list) else out.get("model_url")
-            if d["status"] in ("failed","cancelled"): raise RuntimeError(f"Tripo3D processing failed with status {d['status']}: {d.get('error_message', 'Unknown Error')}")
-            time.sleep(3)
-
-    def _dl(self, url):
-            r = requests.get(url, stream=True)
-            r.raise_for_status()
-            
-            export_dir = self.settings.get("export_dir", DEFAULT_EXPORT_DIR)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            final_path = os.path.join(export_dir, f"scanned_model_{timestamp}.glb")
-            
-            with open(final_path, "wb") as f:
-                for chunk in r.iter_content(8192): 
-                    f.write(chunk)
-            
-            self.settings["output_path"] = final_path
-            
-            # Automatically export ALL formats: GLB, OBJ, STL, FBX, BLEND
-            try:
-                self.log_msg.emit("🔄 Generating universal exports (OBJ, STL, FBX, BLEND)...")
-                convert_model_to_all_formats(
-                    final_path,
-                    export_dir=export_dir,
-                    base_name=f"scanned_model_{timestamp}",
-                    tripo_api_key=self.settings.get("tripo_api_key"),
-                    log_fn=lambda m: self.log_msg.emit(m)
-                )
-                self.log_msg.emit("✅ Universal exports generated: GLB, OBJ, STL, FBX, .BLEND")
-            except Exception as e:
-                self.log_msg.emit(f"[WARN] Universal format export warning: {e}")
-
-
-# ── Main Window ───────────────────────────────────────────────────────────────
+# ── Main Application Window ───────────────────────────────────────────────────
 class ModernScannerApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("3D Object Scanner & Reconstruction Studio")
-        self.resize(1200, 740)
-        self.setStyleSheet("""
-            QMainWindow  { background:#101010; color:#fff; }
-            QLabel       { color:#fff; }
-            QTextBrowser { background:#151515; color:#ccc; border:1px solid #333; }
-            QPushButton  { background:#2b719e; color:#fff; padding:8px;
-                           border-radius:4px; border:none; font-weight:bold; }
-            QPushButton:hover    { background:#3b8dc0; }
-            QPushButton:disabled { background:#555; color:#888; }
-            QLineEdit  { background:#1a1a1a; color:#fff; padding:5px;
-                         border:1px solid #444; border-radius:3px; }
-            QSpinBox   { background:#1a1a1a; color:#fff; padding:4px;
-                         border:1px solid #444; border-radius:3px; }
-            QGroupBox  { border:1px solid #333; margin-top:1ex;
-                         font-weight:bold; color:#777; }
-            QProgressBar {
-                background:#222; border:1px solid #444; border-radius:4px;
-                text-align:center; color:#fff; font-weight:bold;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00BCD4, stop:1 #2196F3);
-                border-radius:3px;
-            }
-        """)
+        self.setWindowTitle("3D Scanner Studio — Professional Hardware Capture & Reconstruction")
+        self.resize(1340, 840)
+        self.setMinimumSize(1100, 700)
+        self.setStyleSheet(GLOBAL_STYLESHEET)
 
-        # State
-        self.current_manual_orientation = "front"
-        self.manual_capture_count       = 0
-        self.latest_frame               = None
-        self.scan_thread                = None
-        self._httpd                     = None
-        self.camera_index               = SETTINGS.get("camera_index", 1)
-        self.camera_enabled             = True
-        self.camera_frame_lock          = threading.Lock()
-        self._cam_auto_paused           = False  # True when stopped for Auto Turntable
-        self._current_model_path        = None   # Track loaded model for export
-        self._labels_visible            = True    # Toggle labels on/off
+        # State Variables
+        self.manual_capture_count = 0
+        self.latest_frame = None
+        self.scan_thread = None
+        self._httpd = None
+        self.camera_index = SETTINGS.get("camera_index", 1)
+        self.camera_enabled = True
+        self.camera_frame_lock = threading.Lock()
+        self._cam_auto_paused = False
+        self._current_model_path = None
+        self._labels_visible = True
 
+        # Root Central Layout
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
-        root.addWidget(self._left_panel())
-        root.addWidget(self._right_panel())
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self._start_camera_thread()  # Start after both panels built
+        # 1. Top Header Bar
+        root.addWidget(self._build_top_header())
 
-    # ── Camera management ─────────────────────────────────────────────────────
-    def _start_camera_thread(self):
-        self.camera_thread = CameraThread(cam_index=self.camera_index)
-        self.camera_thread.new_frame.connect(self.update_video_feed)
-        self.camera_thread.frame_ready_for_capture.connect(self.store_frame)
-        self.camera_thread.start()
-        self.camera_enabled = True
-        self.btn_cam_toggle.setText("⏸  Disable Camera")
-        self.btn_cam_toggle.setStyleSheet("background:#6d4c41;")
+        # 2. Main Workstation Body (Splitter for resizable control dock)
+        body_splitter = QSplitter(Qt.Orientation.Horizontal)
+        body_splitter.setHandleWidth(1)
+        body_splitter.addWidget(self._build_left_dock())
+        body_splitter.addWidget(self._build_right_viewport())
+        body_splitter.setSizes([380, 960])
+        root.addWidget(body_splitter, stretch=1)
 
-    def _stop_camera_thread(self):
-        self.camera_thread.stop()
-        self.camera_enabled = False
-        self.btn_cam_toggle.setText("▶  Enable Camera")
-        self.btn_cam_toggle.setStyleSheet("background:#2e7d32;")
-        if self.stack.currentIndex() == 0:
-            self.cam_lbl.setPixmap(QPixmap())
-            self.cam_lbl.setText("[ CAMERA DISABLED ]")
+        # Start Camera Thread
+        self._start_camera_thread()
 
-    # ── UI builders ───────────────────────────────────────────────────────────
-    def _left_panel(self):
-        p = QFrame(); p.setFixedWidth(320)
-        p.setStyleSheet("background:#1a1a1a;")
-        lay = QVBoxLayout(p); lay.setContentsMargins(16, 16, 16, 16)
+    # ── Top Studio Header ─────────────────────────────────────────────────────
+    def _build_top_header(self):
+        header = QFrame()
+        header.setFixedHeight(48)
+        header.setStyleSheet("background-color: #10141d; border-bottom: 1px solid #1e2637; padding: 0 16px;")
+        h_lay = QHBoxLayout(header)
+        h_lay.setContentsMargins(12, 0, 12, 0)
+        h_lay.setSpacing(14)
 
-        # Title row + ⚙ gear button
-        title_row = QHBoxLayout()
-        t = QLabel("3D OBJECT SCANNER")
-        f = QFont(); f.setPointSize(13); f.setBold(True); t.setFont(f)
-        t.setStyleSheet("color:#00BCD4;")
-        title_row.addWidget(t, stretch=1)
-        btn_gear = QPushButton("⚙")
-        btn_gear.setFixedSize(32, 32)
-        btn_gear.setToolTip("Open Settings")
-        btn_gear.setStyleSheet(
-            "background:#333; font-size:16px; padding:0; border-radius:4px;"
+        # Branding
+        title = QLabel("3D SCANNER STUDIO")
+        title.setObjectName("headingLabel")
+        h_lay.addWidget(title)
+
+        pro_badge = QLabel("PRO")
+        pro_badge.setStyleSheet(
+            "font-family: 'Consolas', monospace; font-size: 9px; font-weight: 700;"
+            "color: #38bdf8; background: rgba(56, 189, 248, 0.12);"
+            "border: 1px solid rgba(56, 189, 248, 0.3); padding: 2px 6px; border-radius: 3px;"
         )
-        btn_gear.clicked.connect(self.open_settings)
-        title_row.addWidget(btn_gear)
-        lay.addLayout(title_row)
-        lay.addSpacing(8)
+        h_lay.addWidget(pro_badge)
 
-        # ── Progress Bar ──────────────────────────────────────────────────────
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(18)
-        self.progress_bar.setVisible(False)
-        lay.addWidget(self.progress_bar)
-        lay.addSpacing(4)
+        h_lay.addSpacing(16)
 
-        # ── AI 3D Reconstruction from Photos ─────────────────────────────────
-        gen_box = QGroupBox("✨ AI 3D Reconstruction")
-        gen_box.setStyleSheet("""
-            QGroupBox { 
-                border: 1px solid #00BCD4; margin-top:1ex; 
-                font-weight:bold; color:#00BCD4; 
-                padding-top: 14px;
-            }
-        """)
-        gen_lay = QVBoxLayout(gen_box)
+        # Hardware & Engine Telemetry Chips
+        self.lbl_hw_chip = QLabel(f"TURNTABLE: {SETTINGS.get('arduino_port', 'COM4')}")
+        self.lbl_hw_chip.setObjectName("statusPill")
+        h_lay.addWidget(self.lbl_hw_chip)
 
-        self.btn_gen_image = QPushButton("📸  Single Photo → 3D")
-        self.btn_gen_image.setStyleSheet("""
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00897B, stop:1 #00BCD4);
-                color: #fff; font-size: 11px; padding: 7px;
-                border-radius: 5px;
-            }
-            QPushButton:hover { 
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00ACC1, stop:1 #26C6DA);
-            }
-        """)
-        self.btn_gen_image.clicked.connect(self.generate_from_image)
-        gen_lay.addWidget(self.btn_gen_image)
+        self.lbl_engine_chip = QLabel("ENGINE: TRIPOSR LOCAL")
+        self.lbl_engine_chip.setStyleSheet(
+            "font-family: 'Consolas', monospace; font-size: 10px; font-weight: 600;"
+            "color: #94a3b8; background: #161b26; border: 1px solid #232c3d;"
+            "padding: 3px 8px; border-radius: 4px;"
+        )
+        h_lay.addWidget(self.lbl_engine_chip)
 
-        self.btn_gen_multi = QPushButton("🖼️  Multiple Photos (Multiview)")
-        self.btn_gen_multi.setStyleSheet("""
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00695C, stop:1 #00897B);
-                color: #fff; font-size: 11px; padding: 7px;
-                border-radius: 5px;
-            }
-            QPushButton:hover { background: #009688; }
-        """)
-        self.btn_gen_multi.clicked.connect(self.generate_from_multiple_images)
-        gen_lay.addWidget(self.btn_gen_multi)
+        h_lay.addStretch(1)
 
-        self.btn_gen_folder = QPushButton("📁  Folder of Photos → 3D")
-        self.btn_gen_folder.setStyleSheet("""
-            QPushButton { 
-                background: #37474F; color: #fff; font-size: 11px; padding: 6px;
-                border-radius: 5px;
-            }
-            QPushButton:hover { background: #455A64; }
-        """)
-        self.btn_gen_folder.clicked.connect(self.generate_from_folder)
-        gen_lay.addWidget(self.btn_gen_folder)
+        # Action Shortcuts
+        btn_open_exp = QPushButton("Exports Folder")
+        btn_open_exp.setToolTip("Open output directory containing exported 3D assets")
+        btn_open_exp.clicked.connect(self.open_export_dir)
+        h_lay.addWidget(btn_open_exp)
 
-        self.lbl_selected_img = QLabel("Select any photo(s) to reconstruct")
-        self.lbl_selected_img.setStyleSheet("color:#666; font-size:10px;")
-        self.lbl_selected_img.setWordWrap(True)
-        gen_lay.addWidget(self.lbl_selected_img)
+        btn_settings = QPushButton("Settings")
+        btn_settings.setToolTip("Configure hardware serial, camera, and neural engine")
+        btn_settings.clicked.connect(self.open_settings)
+        h_lay.addWidget(btn_settings)
 
-        lay.addWidget(gen_box)
-        lay.addSpacing(6)
+        return header
 
-        # Mode toggle
-        self.mode_btn = QPushButton("Mode: Auto Turntable")
-        self.mode_btn.setStyleSheet("background:#333;")
-        self.mode_btn.clicked.connect(self.toggle_mode)
-        lay.addWidget(self.mode_btn)
-        lay.addSpacing(4)
+    # ── Left Control Dock ─────────────────────────────────────────────────────
+    def _build_left_dock(self):
+        dock = QFrame()
+        dock.setObjectName("dockPanel")
+        dock.setMinimumWidth(340)
+        dock.setMaximumWidth(460)
 
-        # Images-per-scan spinbox
-        img_row = QHBoxLayout()
-        lbl_img = QLabel("Manual shots:")
-        lbl_img.setStyleSheet("color:#aaa; font-size:12px;")
-        img_row.addWidget(lbl_img)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("background: transparent;")
+
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(12)
+
+        # ── 1. Turntable & Hardware Capture ──
+        hw_box = QGroupBox("Hardware Capture & Turntable")
+        hw_lay = QVBoxLayout(hw_box)
+        hw_lay.setSpacing(8)
+
+        # Mode Segmented Switcher
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(4)
+        self.btn_mode_auto = QPushButton("Automated Turntable")
+        self.btn_mode_auto.setObjectName("segmentBtn")
+        self.btn_mode_auto.setProperty("active", True)
+        self.btn_mode_auto.clicked.connect(lambda: self._set_capture_mode("Auto"))
+
+        self.btn_mode_manual = QPushButton("Manual Scan")
+        self.btn_mode_manual.setObjectName("segmentBtn")
+        self.btn_mode_manual.setProperty("active", False)
+        self.btn_mode_manual.clicked.connect(lambda: self._set_capture_mode("Manual"))
+
+        mode_row.addWidget(self.btn_mode_auto)
+        mode_row.addWidget(self.btn_mode_manual)
+        hw_lay.addLayout(mode_row)
+
+        # Angle & Shots Telemetry
+        shots_row = QHBoxLayout()
+        self.lbl_shots_info = QLabel("Rotary Step: 10° (36 views)")
+        self.lbl_shots_info.setObjectName("metaLabel")
+        shots_row.addWidget(self.lbl_shots_info)
+
         self.spn_images = QSpinBox()
         self.spn_images.setRange(1, 72)
-        self.spn_images.setValue(SETTINGS.get("num_images", 4))
-        self.spn_images.setFixedWidth(68)
-        self.spn_images.setToolTip(
-            "Number of manual captures in Manual Scan mode."
-        )
-        self.spn_images.valueChanged.connect(
-            lambda v: SETTINGS.update({"num_images": v})
-        )
-        img_row.addWidget(self.spn_images)
-        lay.addLayout(img_row)
-        lay.addSpacing(4)
+        self.spn_images.setValue(SETTINGS.get("num_images", 8))
+        self.spn_images.setFixedWidth(64)
+        self.spn_images.valueChanged.connect(self._on_shots_changed)
+        shots_row.addWidget(self.spn_images)
+        hw_lay.addLayout(shots_row)
 
-        # Scan / compile button
-        self.btn_action = QPushButton("Execute Hardware Loop")
+        # Primary Loop Action Button
+        self.btn_action = QPushButton("Execute Turntable Loop")
+        self.btn_action.setObjectName("primaryActionBtn")
+        self.btn_action.setFixedHeight(32)
         self.btn_action.clicked.connect(self.start_scan)
-        lay.addWidget(self.btn_action)
+        hw_lay.addWidget(self.btn_action)
 
-        # Manual capture button (hidden in Auto mode)
-        self.btn_capture = QPushButton("Capture View (1)")
-        self.btn_capture.setStyleSheet("background:#bd6813;")
-        self.btn_capture.setDisabled(True)
+        # Manual Capture Button
+        self.btn_capture = QPushButton("Capture View (1/8)")
+        self.btn_capture.setFixedHeight(28)
+        self.btn_capture.setVisible(False)
         self.btn_capture.clicked.connect(self.capture_manual)
-        lay.addWidget(self.btn_capture)
-        lay.addSpacing(4)
+        hw_lay.addWidget(self.btn_capture)
 
-        # Re-process
-        self.btn_reprocess = QPushButton("Re-Process Existing Images")
-        self.btn_reprocess.setStyleSheet("background:#2e7d32;")
+        # Camera Hardware Toolbar
+        cam_row = QHBoxLayout()
+        cam_row.setSpacing(6)
+        self.btn_cam_toggle = QPushButton("Pause Camera")
+        self.btn_cam_toggle.clicked.connect(self.toggle_camera)
+        cam_row.addWidget(self.btn_cam_toggle, stretch=3)
+
+        self.btn_cam_switch = QPushButton("Ext Camera")
+        self.btn_cam_switch.clicked.connect(self.switch_camera)
+        cam_row.addWidget(self.btn_cam_switch, stretch=2)
+        hw_lay.addLayout(cam_row)
+
+        # Re-process button
+        self.btn_reprocess = QPushButton("Re-Process Existing Frames")
         self.btn_reprocess.clicked.connect(self.reprocess_existing_images)
-        lay.addWidget(self.btn_reprocess)
-        lay.addSpacing(4)
+        hw_lay.addWidget(self.btn_reprocess)
 
-        # Load GLB
-        self.btn_load = QPushButton("Load External .GLB Mesh")
-        self.btn_load.setStyleSheet("background:#444;")
-        self.btn_load.clicked.connect(self.load_mesh)
-        lay.addWidget(self.btn_load)
-        lay.addSpacing(4)
+        lay.addWidget(hw_box)
 
-        # View Scanned Model button
-        self.btn_view_model = QPushButton("🌐  View Scanned 3D Model")
-        self.btn_view_model.setStyleSheet("""
-            QPushButton { 
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #00838F, stop:1 #00ACC1);
-                color: #fff; font-weight: bold; font-size: 11px; padding: 7px;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background: #26C6DA; }
-        """)
-        self.btn_view_model.setToolTip("Directly load and view the current 3D model in the interactive viewer")
-        self.btn_view_model.clicked.connect(self.view_loaded_model)
-        lay.addWidget(self.btn_view_model)
-        lay.addSpacing(4)
+        # ── 2. Neural 3D Reconstruction ──
+        ai_box = QGroupBox("Neural 3D Reconstruction")
+        ai_lay = QVBoxLayout(ai_box)
+        ai_lay.setSpacing(8)
 
-        # ── Export to Blender Section ─────────────────────────────────────────
-        export_box = QGroupBox("📦 Export to Blender")
-        export_box.setStyleSheet("""
-            QGroupBox { 
-                border: 1px solid #FF9800; margin-top:1ex;
-                font-weight:bold; color:#FF9800;
-                padding-top: 14px;
-            }
-        """)
-        exp_lay = QVBoxLayout(export_box)
+        ai_btn_row = QHBoxLayout()
+        ai_btn_row.setSpacing(6)
 
-        btn_row = QHBoxLayout()
-        self.btn_export_fbx = QPushButton("FBX")
-        self.btn_export_fbx.setStyleSheet("background:#E65100; font-size:11px; padding:5px;")
-        self.btn_export_fbx.setToolTip("Export as FBX — best for Blender & animation")
-        self.btn_export_fbx.clicked.connect(lambda: self.export_for_blender("FBX"))
+        self.btn_gen_image = QPushButton("Single Image")
+        self.btn_gen_image.setToolTip("Reconstruct complete 3D geometry from a single photo")
+        self.btn_gen_image.clicked.connect(self.generate_from_image)
+        ai_btn_row.addWidget(self.btn_gen_image)
 
-        self.btn_export_obj = QPushButton("OBJ")
-        self.btn_export_obj.setStyleSheet("background:#BF360C; font-size:11px; padding:5px;")
-        self.btn_export_obj.setToolTip("Export as OBJ — universal 3D format")
-        self.btn_export_obj.clicked.connect(lambda: self.export_for_blender("OBJ"))
+        self.btn_gen_multi = QPushButton("Multi-Angle")
+        self.btn_gen_multi.setToolTip("Process multiple perspective captures")
+        self.btn_gen_multi.clicked.connect(self.generate_from_multiple_images)
+        ai_btn_row.addWidget(self.btn_gen_multi)
 
-        self.btn_export_stl = QPushButton("STL")
-        self.btn_export_stl.setStyleSheet("background:#8D6E63; font-size:11px; padding:5px;")
-        self.btn_export_stl.setToolTip("Export as STL — for 3D printing")
-        self.btn_export_stl.clicked.connect(lambda: self.export_for_blender("STL"))
+        self.btn_gen_folder = QPushButton("Batch Directory")
+        self.btn_gen_folder.setToolTip("Select a folder containing photos")
+        self.btn_gen_folder.clicked.connect(self.generate_from_folder)
+        ai_btn_row.addWidget(self.btn_gen_folder)
+        ai_lay.addLayout(ai_btn_row)
 
-        self.btn_export_glb = QPushButton("GLB")
-        self.btn_export_glb.setStyleSheet("background:#546E7A; font-size:11px; padding:5px;")
-        self.btn_export_glb.setToolTip("Copy GLB to export folder")
-        self.btn_export_glb.clicked.connect(lambda: self.export_for_blender("GLB"))
+        self.lbl_selected_img = QLabel("Select an image or directory to reconstruct")
+        self.lbl_selected_img.setObjectName("metaLabel")
+        self.lbl_selected_img.setWordWrap(True)
+        ai_lay.addWidget(self.lbl_selected_img)
 
-        self.btn_export_blend = QPushButton("BLEND")
-        self.btn_export_blend.setStyleSheet("background:#F57C00; font-size:11px; padding:5px; font-weight:bold;")
-        self.btn_export_blend.setToolTip("Generate Native Blender .blend Master Scene")
-        self.btn_export_blend.clicked.connect(lambda: self.export_for_blender("BLEND"))
+        # Minimalist Linear Progress Bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(8)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        ai_lay.addWidget(self.progress_bar)
 
-        btn_row.addWidget(self.btn_export_fbx)
-        btn_row.addWidget(self.btn_export_obj)
-        btn_row.addWidget(self.btn_export_stl)
-        btn_row.addWidget(self.btn_export_glb)
-        btn_row.addWidget(self.btn_export_blend)
-        exp_lay.addLayout(btn_row)
+        lay.addWidget(ai_box)
 
-        self.btn_open_blender = QPushButton("🚀  Open in Blender 5.2")
-        self.btn_open_blender.setStyleSheet("""
-            QPushButton {
-                background: #D84315; color:#fff; font-size:11px; font-weight:bold;
-                padding:6px; border-radius:4px;
-            }
-            QPushButton:hover { background: #BF360C; }
-        """)
-        self.btn_open_blender.setToolTip("Open the current 3D model directly inside Blender")
+        # ── 3. Asset Pipeline & Blender ──
+        exp_box = QGroupBox("Asset Exports & Blender Studio")
+        exp_lay = QVBoxLayout(exp_box)
+        exp_lay.setSpacing(8)
+
+        # Export Grid
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(4)
+        for fmt in ("GLB", "OBJ", "STL", "FBX", "BLEND"):
+            btn = QPushButton(fmt)
+            btn.clicked.connect(lambda checked, f=fmt: self.export_for_blender(f))
+            grid_row.addWidget(btn)
+        exp_lay.addLayout(grid_row)
+
+        # Open in Blender Action
+        self.btn_open_blender = QPushButton("Launch in Blender Studio")
+        self.btn_open_blender.setObjectName("studioActionBtn")
+        self.btn_open_blender.setFixedHeight(30)
         self.btn_open_blender.clicked.connect(self.open_current_in_blender)
         exp_lay.addWidget(self.btn_open_blender)
 
-        self.lbl_export_status = QLabel("Load or generate a model first")
-        self.lbl_export_status.setStyleSheet("color:#666; font-size:10px;")
-        self.lbl_export_status.setWordWrap(True)
-        exp_lay.addWidget(self.lbl_export_status)
+        load_row = QHBoxLayout()
+        self.btn_load = QPushButton("Import External GLB")
+        self.btn_load.clicked.connect(self.load_mesh)
+        load_row.addWidget(self.btn_load)
 
-        lay.addWidget(export_box)
-        lay.addSpacing(4)
+        self.lbl_export_status = QLabel("Ready for generation")
+        self.lbl_export_status.setObjectName("metaLabel")
+        load_row.addWidget(self.lbl_export_status)
+        exp_lay.addLayout(load_row)
 
-        # ── Label Toggle & Back ───────────────────────────────────────────────
-        ctrl_row = QHBoxLayout()
+        lay.addWidget(exp_box)
 
-        self.btn_toggle_labels = QPushButton("🏷  Labels: ON")
-        self.btn_toggle_labels.setStyleSheet("background:#37474F; font-size:11px;")
-        self.btn_toggle_labels.clicked.connect(self.toggle_labels)
-        ctrl_row.addWidget(self.btn_toggle_labels)
+        # ── 4. Diagnostics & Console ──
+        diag_box = QGroupBox("Activity Console & Diagnostics")
+        diag_lay = QVBoxLayout(diag_box)
+        diag_lay.setSpacing(6)
 
-        self.btn_back_cam = QPushButton("🔙  Camera")
-        self.btn_back_cam.setStyleSheet("background:#0d47a1; font-size:11px;")
-        self.btn_back_cam.clicked.connect(self.back_to_camera)
-        ctrl_row.addWidget(self.btn_back_cam)
-
-        lay.addLayout(ctrl_row)
-        lay.addSpacing(6)
-
-        # Camera controls row
-        cam_row = QHBoxLayout()
-        self.btn_cam_toggle = QPushButton("⏸  Disable Camera")
-        self.btn_cam_toggle.setStyleSheet("background:#6d4c41;")
-        self.btn_cam_toggle.setToolTip("Enable or disable the live camera feed")
-        self.btn_cam_toggle.clicked.connect(self.toggle_camera)
-        cam_row.addWidget(self.btn_cam_toggle, stretch=1)
-
-        self.btn_cam_switch = QPushButton("📷 Ext")
-        self.btn_cam_switch.setFixedWidth(72)
-        self.btn_cam_switch.setStyleSheet("background:#4a148c;")
-        self.btn_cam_switch.clicked.connect(self.switch_camera)
-        cam_row.addWidget(self.btn_cam_switch)
-        lay.addLayout(cam_row)
-        self._refresh_cam_switch_label()
-        lay.addSpacing(6)
-
-        # Diagnostics
-        diag_lbl = QLabel("SYSTEM DIAGNOSTICS")
-        diag_lbl.setStyleSheet("color:#aaaaaa; font-weight:bold;")
-        lay.addWidget(diag_lbl)
         self.txt = QTextBrowser()
+        self.txt.setMinimumHeight(130)
         self.txt.setOpenExternalLinks(True)
-        lay.addWidget(self.txt)
+        diag_lay.addWidget(self.txt)
 
-        # FYP attribution at bottom
         self.lbl_fyp = QLabel("")
-        self.lbl_fyp.setStyleSheet("color:#555; font-size:10px;")
-        self.lbl_fyp.setWordWrap(True)
+        self.lbl_fyp.setObjectName("metaLabel")
         self.lbl_fyp.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self.lbl_fyp)
+        diag_lay.addWidget(self.lbl_fyp)
         self._refresh_fyp_label()
 
-        return p
+        lay.addWidget(diag_box)
+        lay.addStretch(1)
 
-    def _right_panel(self):
-        p = QFrame(); p.setStyleSheet("background:#101010;")
-        lay = QVBoxLayout(p); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        scroll.setWidget(content)
+        dock_lay = QVBoxLayout(dock)
+        dock_lay.setContentsMargins(0, 0, 0, 0)
+        dock_lay.addWidget(scroll)
+        return dock
 
+    # ── Right Main Viewport ───────────────────────────────────────────────────
+    def _build_right_viewport(self):
+        vp = QFrame()
+        vp.setObjectName("viewportFrame")
+        lay = QVBoxLayout(vp)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        # Viewport Header Toolbar
+        vp_header = QFrame()
+        vp_header.setFixedHeight(42)
+        vp_header.setStyleSheet("background-color: #0d1118; border-bottom: 1px solid #1c2433; padding: 0 16px;")
+        vh_lay = QHBoxLayout(vp_header)
+        vh_lay.setContentsMargins(12, 0, 12, 0)
+        vh_lay.setSpacing(10)
+
+        # Viewport Mode Segment
+        self.btn_vp_cam = QPushButton("Camera Feed")
+        self.btn_vp_cam.setObjectName("segmentBtn")
+        self.btn_vp_cam.setProperty("active", True)
+        self.btn_vp_cam.clicked.connect(self.back_to_camera)
+
+        self.btn_vp_3d = QPushButton("3D WebGL Viewport")
+        self.btn_vp_3d.setObjectName("segmentBtn")
+        self.btn_vp_3d.setProperty("active", False)
+        self.btn_vp_3d.clicked.connect(self.view_loaded_model)
+
+        vh_lay.addWidget(self.btn_vp_cam)
+        vh_lay.addWidget(self.btn_vp_3d)
+        vh_lay.addSpacing(16)
+
+        # Dynamic Dimensions / Status Label
+        self.lbl_vp_telemetry = QLabel("SENSOR READY — AWAITING CAPTURE")
+        self.lbl_vp_telemetry.setStyleSheet(
+            "font-family: 'Consolas', monospace; font-size: 11px; font-weight: 600; color: #38bdf8;"
+        )
+        vh_lay.addWidget(self.lbl_vp_telemetry)
+
+        vh_lay.addStretch(1)
+
+        # 3D Viewport Controls
+        self.btn_toggle_labels = QPushButton("Labels: ON")
+        self.btn_toggle_labels.setToolTip("Toggle 3D measurement bounding callouts")
+        self.btn_toggle_labels.clicked.connect(self.toggle_labels)
+        vh_lay.addWidget(self.btn_toggle_labels)
+
+        lay.addWidget(vp_header)
+
+        # Viewport Stack
         self.stack = QStackedWidget()
 
-        # Index 0 – live camera feed
-        self.cam_lbl = QLabel("[ INITIALIZING LIVE VIEWPORT ]")
+        # Page 0: Live Camera Feed
+        self.cam_lbl = QLabel("[ LIVE VIEWPORT INITIALIZING ]")
         self.cam_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cam_lbl.setStyleSheet("background:#050505; color:#666;")
+        self.cam_lbl.setStyleSheet("background-color: #07090e; color: #475569; font-family: 'Consolas', monospace;")
         self.stack.addWidget(self.cam_lbl)
 
-        # Index 1 – 3-D viewer (WebEngine)
+        # Page 1: 3D WebGL Viewport
         profile = QWebEngineProfile.defaultProfile()
         s = profile.settings()
         s.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
@@ -1093,45 +1169,97 @@ class ModernScannerApp(QMainWindow):
 
         self.webview = QWebEngineView()
         self.stack.addWidget(self.webview)
-        lay.addWidget(self.stack)
-        return p
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+        lay.addWidget(self.stack, stretch=1)
+        return vp
+
+    # ── Camera Management ─────────────────────────────────────────────────────
+    def _start_camera_thread(self):
+        self.camera_thread = CameraThread(cam_index=self.camera_index)
+        self.camera_thread.new_frame.connect(self.update_video_feed)
+        self.camera_thread.frame_ready_for_capture.connect(self.store_frame)
+        self.camera_thread.start()
+        self.camera_enabled = True
+        self.btn_cam_toggle.setText("Pause Camera")
+        self._refresh_cam_switch_label()
+
+    def _stop_camera_thread(self):
+        self.camera_thread.stop()
+        self.camera_enabled = False
+        self.btn_cam_toggle.setText("Resume Camera")
+        if self.stack.currentIndex() == 0:
+            self.cam_lbl.setPixmap(QPixmap())
+            self.cam_lbl.setText("[ CAMERA SENSOR PAUSED ]")
+
+    # ── Helpers & State Sync ──────────────────────────────────────────────────
     def log(self, msg):
-        self.txt.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        timestamp = time.strftime("%H:%M:%S")
+        prefix = f'<span style="color:#64748b;">[{timestamp}]</span> '
+        if "[+]" in msg or "[✓]" in msg:
+            colored = f'{prefix}<span style="color:#10b981;">{msg}</span>'
+        elif "[!]" in msg or "[WARN]" in msg:
+            colored = f'{prefix}<span style="color:#f59e0b;">{msg}</span>'
+        elif "[ERROR]" in msg or "ERROR" in msg:
+            colored = f'{prefix}<span style="color:#ef4444;">{msg}</span>'
+        elif "[*]" in msg:
+            colored = f'{prefix}<span style="color:#38bdf8;">{msg}</span>'
+        else:
+            colored = f'{prefix}<span style="color:#cbd5e1;">{msg}</span>'
+        self.txt.append(colored)
 
     def _refresh_fyp_label(self):
         students = SETTINGS.get("students", [])
         if students:
-            parts = [
-                f"{s['name']} ({s['roll']})"
-                for s in students if s.get("name") or s.get("roll")
-            ]
-            self.lbl_fyp.setText("FYP: " + " | ".join(parts) if parts else "")
+            parts = [f"{s.get('name', '')} ({s.get('roll', '')})" for s in students if s.get("name") or s.get("roll")]
+            self.lbl_fyp.setText("FYP Team: " + " | ".join(parts))
         else:
-            self.lbl_fyp.setText("FYP Members name here.....")
+            self.lbl_fyp.setText("FYP Team Attribution")
 
     def _refresh_cam_switch_label(self):
         if self.camera_index == 1:
-            self.btn_cam_switch.setText("📷 Ext")
-            self.btn_cam_switch.setToolTip(
-                "Currently: External webcam\nClick to switch to Laptop camera"
-            )
+            self.btn_cam_switch.setText("Ext Camera")
         else:
-            self.btn_cam_switch.setText("💻 Lap")
-            self.btn_cam_switch.setToolTip(
-                "Currently: Laptop camera\nClick to switch to External webcam"
-            )
+            self.btn_cam_switch.setText("Built-in")
+
+    def _set_capture_mode(self, mode):
+        is_auto = (mode == "Auto")
+        self.btn_mode_auto.setProperty("active", is_auto)
+        self.btn_mode_manual.setProperty("active", not is_auto)
+        self.btn_mode_auto.style().unpolish(self.btn_mode_auto)
+        self.btn_mode_auto.style().polish(self.btn_mode_auto)
+        self.btn_mode_manual.style().unpolish(self.btn_mode_manual)
+        self.btn_mode_manual.style().polish(self.btn_mode_manual)
+
+        if is_auto:
+            self.btn_action.setText("Execute Turntable Loop")
+            self.btn_action.setEnabled(True)
+            self.btn_capture.setVisible(False)
+            self.log("[*] Switched to Automated Turntable mode.")
+        else:
+            self.btn_action.setText("Compile Captured Views")
+            self.btn_action.setEnabled(False)
+            self.btn_capture.setVisible(True)
+            self.manual_capture_count = 0
+            self._update_capture_btn_label()
+            self.log("[*] Switched to Manual Capture mode.")
+
+    def _on_shots_changed(self, val):
+        SETTINGS["num_images"] = val
+        step = SETTINGS.get("rotation_step", 10)
+        self.lbl_shots_info.setText(f"Rotary Step: {step}° ({val} views)")
 
     def _update_capture_btn_label(self):
-        num  = self.spn_images.value()
+        num = self.spn_images.value()
         done = self.manual_capture_count
         if done < num:
             self.btn_capture.setText(f"Capture View ({done + 1}/{num})")
+            self.btn_capture.setEnabled(True)
         else:
-            self.btn_capture.setText("All Views Captured ✔")
+            self.btn_capture.setText("All Views Captured")
+            self.btn_capture.setEnabled(False)
+            self.btn_action.setEnabled(True)
 
-    # ── Slots ─────────────────────────────────────────────────────────────────
+    # ── Slots & Actions ───────────────────────────────────────────────────────
     @pyqtSlot(object)
     def store_frame(self, frame):
         with self.camera_frame_lock:
@@ -1154,40 +1282,25 @@ class ModernScannerApp(QMainWindow):
     def open_settings(self):
         dlg = SettingsDialog(SETTINGS, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            # Sync spinbox with possibly-updated value
-            self.spn_images.blockSignals(True)
-            self.spn_images.setValue(SETTINGS.get("num_images", 4))
-            self.spn_images.blockSignals(False)
+            self.spn_images.setValue(SETTINGS.get("num_images", 8))
+            self.lbl_hw_chip.setText(f"TURNTABLE: {SETTINGS.get('arduino_port', 'COM4')}")
             self._refresh_fyp_label()
-            self.log("Settings saved.")
+            self.log("[✓] Studio configuration updated.")
 
     @pyqtSlot()
-    def toggle_mode(self):
-        if "Auto" in self.mode_btn.text():
-            self.mode_btn.setText("Mode: Manual Scan")
-            self.btn_action.setText("Compile Manual Views")
-            self.btn_action.setDisabled(True)
-            self.btn_capture.setEnabled(True)
-            self.manual_capture_count = 0
-            self._update_capture_btn_label()
-            self.log("Switched to Manual capture mode.")
-        else:
-            self.mode_btn.setText("Mode: Auto Turntable")
-            self.btn_action.setText("Execute Hardware Loop")
-            self.btn_action.setEnabled(True)
-            self.btn_capture.setDisabled(True)
-            self.log("Switched to Auto Turntable mode.")
+    def open_export_dir(self):
+        export_dir = SETTINGS.get("export_dir", DEFAULT_EXPORT_DIR)
+        os.makedirs(export_dir, exist_ok=True)
+        os.startfile(export_dir)
 
     @pyqtSlot()
     def toggle_camera(self):
         if self.camera_enabled:
             self._stop_camera_thread()
-            self.log("Camera disabled.")
+            self.log("[*] Camera sensor paused.")
         else:
             self._start_camera_thread()
-            if self.stack.currentIndex() == 0:
-                self.cam_lbl.setText("[ LIVE VIEWPORT ]")
-            self.log("Camera enabled.")
+            self.log("[*] Camera sensor resumed.")
 
     @pyqtSlot()
     def switch_camera(self):
@@ -1197,83 +1310,68 @@ class ModernScannerApp(QMainWindow):
         self.camera_index = 1 - self.camera_index
         SETTINGS["camera_index"] = self.camera_index
         self._refresh_cam_switch_label()
-        label = "External webcam" if self.camera_index == 1 else "Laptop camera"
-        self.log(f"Switched to {label}.")
+        self.log(f"[*] Switched camera index to {self.camera_index}.")
         if was_enabled:
             self._start_camera_thread()
 
     @pyqtSlot()
     def capture_manual(self):
-        if self.latest_frame is None:
-            self.log("[WARN] No camera frame available yet.")
+        frame = self.get_latest_frame()
+        if frame is None:
+            self.log("[!] Live frame unavailable. Waiting for sensor...")
             return
-        idx  = self.manual_capture_count
-        name = f"img_{idx}.jpg"
-        cv2.imwrite(os.path.join(SCAN_FOLDER, name), self.latest_frame)
-        self.log(f"Saved: {name}")
-        self.manual_capture_count += 1
-        num = self.spn_images.value()
-        if self.manual_capture_count >= num:
-            self.btn_capture.setText("All Views Captured ✔")
-            self.btn_capture.setDisabled(True)
-            self.btn_action.setEnabled(True)
-            self.log(f"All {num} views captured — click 'Compile Manual Views'.")
-        else:
-            self._update_capture_btn_label()
 
-    # ── AI 3D Reconstruction from Photos ─────────────────────────────────
+        idx = self.manual_capture_count
+        name = f"img_{idx}.jpg"
+        cv2.imwrite(os.path.join(SCAN_FOLDER, name), frame)
+        self.log(f"[+] Saved view {idx + 1}: {name}")
+        self.manual_capture_count += 1
+        self._update_capture_btn_label()
+
+    # ── AI Reconstruction Triggers ────────────────────────────────────────────
     @pyqtSlot()
     def generate_from_image(self):
-        """Pick a single photo and reconstruct 3D model."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select Photo for 3D Generation", "",
+            self, "Select Image for 3D Reconstruction", "",
             "Images (*.jpg *.jpeg *.png *.webp *.bmp);;All Files (*)"
         )
         if not path:
             return
 
-        self.lbl_selected_img.setText(f"📁 {os.path.basename(path)}")
-        self.log(f"Selected single photo: {path}")
+        self.lbl_selected_img.setText(os.path.basename(path))
+        self.log(f"[*] Target image selected: {path}")
 
-        self._set_gen_buttons_state(False, "⏳ Generating...")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-
-        self.img_thread = ImageToModelThread(path, SETTINGS, self)
-        self.img_thread.log_msg.connect(self.log)
-        self.img_thread.progress_pct.connect(self.progress_bar.setValue)
-        self.img_thread.scan_complete.connect(self._on_gen_complete)
-        self.img_thread.scan_error.connect(self._on_gen_error)
-        self.img_thread.start()
+        self._set_ui_processing_state(True, "Generating 3D Mesh...")
+        self.reconstruction_thread = ReconstructionThread(path, SETTINGS, parent=self)
+        self.reconstruction_thread.log_msg.connect(self.log)
+        self.reconstruction_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.reconstruction_thread.scan_complete.connect(self._on_reconstruction_complete)
+        self.reconstruction_thread.scan_error.connect(self._on_reconstruction_error)
+        self.reconstruction_thread.start()
 
     @pyqtSlot()
     def generate_from_multiple_images(self):
-        """Pick multiple perspective photos (front, right, back, left) for multiview reconstruction."""
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Select 2-4 Perspective Photos", "",
+            self, "Select Perspective Images", "",
             "Images (*.jpg *.jpeg *.png *.webp *.bmp);;All Files (*)"
         )
         if not paths:
             return
 
-        self.lbl_selected_img.setText(f"📁 {len(paths)} photos selected")
-        self.log(f"Selected {len(paths)} photos for multiview reconstruction.")
+        self.lbl_selected_img.setText(f"{len(paths)} photos selected")
+        self.log(f"[*] Selected {len(paths)} multi-view images.")
 
-        self._set_gen_buttons_state(False, "⏳ Generating Multiview...")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-
-        self.multi_thread = MultiviewToModelThread(paths, SETTINGS, base_name="multiview_model", parent=self)
-        self.multi_thread.log_msg.connect(self.log)
-        self.multi_thread.progress_pct.connect(self.progress_bar.setValue)
-        self.multi_thread.scan_complete.connect(self._on_gen_complete)
-        self.multi_thread.scan_error.connect(self._on_gen_error)
-        self.multi_thread.start()
+        self._set_ui_processing_state(True, "Processing Multi-View...")
+        self.reconstruction_thread = ReconstructionThread(paths, SETTINGS, base_name="multiview_model", parent=self)
+        self.reconstruction_thread.log_msg.connect(self.log)
+        self.reconstruction_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.reconstruction_thread.scan_complete.connect(self._on_reconstruction_complete)
+        self.reconstruction_thread.scan_error.connect(self._on_reconstruction_error)
+        self.reconstruction_thread.start()
 
     @pyqtSlot()
     def generate_from_folder(self):
-        """Select a folder of photos for automated multiview reconstruction."""
-        folder = QFileDialog.getExistingDirectory(self, "Select Folder of Photos")
+        folder = QFileDialog.getExistingDirectory(self, "Select Photos Directory")
         if not folder:
             return
 
@@ -1288,50 +1386,120 @@ class ModernScannerApp(QMainWindow):
             return
 
         base_name = os.path.basename(os.path.normpath(folder))
-        self.lbl_selected_img.setText(f"📁 {base_name} ({len(found)} photos)")
-        self.log(f"Found {len(found)} photos in '{folder}'. Starting multiview reconstruction...")
+        self.lbl_selected_img.setText(f"{base_name} ({len(found)} images)")
+        self.log(f"[*] Directory loaded: {len(found)} images found.")
 
-        self._set_gen_buttons_state(False, "⏳ Processing Folder...")
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
+        self._set_ui_processing_state(True, "Processing Folder...")
+        self.reconstruction_thread = ReconstructionThread(found, SETTINGS, base_name=base_name, parent=self)
+        self.reconstruction_thread.log_msg.connect(self.log)
+        self.reconstruction_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.reconstruction_thread.scan_complete.connect(self._on_reconstruction_complete)
+        self.reconstruction_thread.scan_error.connect(self._on_reconstruction_error)
+        self.reconstruction_thread.start()
 
-        self.multi_thread = MultiviewToModelThread(found, SETTINGS, base_name=base_name, parent=self)
-        self.multi_thread.log_msg.connect(self.log)
-        self.multi_thread.progress_pct.connect(self.progress_bar.setValue)
-        self.multi_thread.scan_complete.connect(self._on_gen_complete)
-        self.multi_thread.scan_error.connect(self._on_gen_error)
-        self.multi_thread.start()
-
-    def _set_gen_buttons_state(self, enabled, status_text=None):
-        self.btn_gen_image.setEnabled(enabled)
-        self.btn_gen_multi.setEnabled(enabled)
-        self.btn_gen_folder.setEnabled(enabled)
-        if enabled:
-            self.btn_gen_image.setText("📸  Single Photo → 3D")
-            self.btn_gen_multi.setText("🖼️  Multiple Photos (Multiview)")
-            self.btn_gen_folder.setText("📁  Folder of Photos → 3D")
-        elif status_text:
-            self.btn_gen_image.setText(status_text)
+    def _set_ui_processing_state(self, processing, label_text=None):
+        self.btn_gen_image.setEnabled(not processing)
+        self.btn_gen_multi.setEnabled(not processing)
+        self.btn_gen_folder.setEnabled(not processing)
+        self.btn_action.setEnabled(not processing)
+        self.progress_bar.setVisible(processing)
+        if processing:
+            self.progress_bar.setValue(0)
+            if label_text:
+                self.lbl_export_status.setText(label_text)
+        else:
+            self.lbl_export_status.setText("Ready for export")
 
     @pyqtSlot(str)
-    def _on_gen_complete(self, glb_path):
-        self._set_gen_buttons_state(True)
-        self.progress_bar.setValue(100)
-        self.log("🎉 3D model generation and multi-format conversion complete!")
+    def _on_reconstruction_complete(self, glb_path):
+        self._set_ui_processing_state(False)
+        self.log(f"[✓] Reconstruction and format conversion complete: {os.path.basename(glb_path)}")
         self.show_model(glb_path)
 
     @pyqtSlot(str)
-    def _on_gen_error(self, err):
-        self._set_gen_buttons_state(True)
-        self.progress_bar.setVisible(False)
-        self.log(f"❌ Generation error: {err}")
-        QMessageBox.critical(self, "Generation Error", err)
+    def _on_reconstruction_error(self, err):
+        self._set_ui_processing_state(False)
+        self.log(f"[!] Reconstruction failed: {err}")
+        QMessageBox.critical(self, "Reconstruction Error", err)
+
+    # ── Hardware Loop Actions ─────────────────────────────────────────────────
+    @pyqtSlot()
+    def start_scan(self):
+        self._set_ui_processing_state(True, "Executing Loop...")
+        mode = "Auto Turntable" if self.btn_mode_auto.property("active") else "Manual Scan"
+
+        self.scan_thread = HardwareScanThread(
+            SETTINGS,
+            mode,
+            frame_supplier=self.get_latest_frame,
+            parent=self
+        )
+        self.scan_thread.log_msg.connect(self.log)
+        self.scan_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.scan_thread.scan_complete.connect(self._on_reconstruction_complete)
+        self.scan_thread.scan_error.connect(self._on_reconstruction_error)
+        self.scan_thread.start()
+
+    @pyqtSlot()
+    def reprocess_existing_images(self):
+        found = _glob.glob(os.path.join(SCAN_FOLDER, "img_*.jpg"))
+        if not found:
+            QMessageBox.warning(self, "No Images", "Scan folder contains no captured frames.")
+            return
+
+        self._set_ui_processing_state(True, "Re-Processing...")
+        self.reconstruction_thread = ReconstructionThread(found, SETTINGS, base_name="reprocessed_scan", parent=self)
+        self.reconstruction_thread.log_msg.connect(self.log)
+        self.reconstruction_thread.progress_pct.connect(self.progress_bar.setValue)
+        self.reconstruction_thread.scan_complete.connect(self._on_reconstruction_complete)
+        self.reconstruction_thread.scan_error.connect(self._on_reconstruction_error)
+        self.reconstruction_thread.start()
+
+    # ── Viewport Switching & Loading ──────────────────────────────────────────
+    @pyqtSlot()
+    def back_to_camera(self):
+        self.stack.setCurrentIndex(0)
+        self.btn_vp_cam.setProperty("active", True)
+        self.btn_vp_3d.setProperty("active", False)
+        self.btn_vp_cam.style().unpolish(self.btn_vp_cam)
+        self.btn_vp_cam.style().polish(self.btn_vp_cam)
+        self.btn_vp_3d.style().unpolish(self.btn_vp_3d)
+        self.btn_vp_3d.style().polish(self.btn_vp_3d)
+        self.lbl_vp_telemetry.setText("SENSOR READY — AWAITING CAPTURE")
+
+    @pyqtSlot()
+    def load_mesh(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load 3D Model Asset", "", "3D Assets (*.glb *.gltf *.obj *.stl *.fbx)"
+        )
+        if path:
+            self.show_model(path)
+
+    @pyqtSlot()
+    def view_loaded_model(self):
+        if self._current_model_path and os.path.exists(self._current_model_path):
+            self.show_model(self._current_model_path)
+        else:
+            default_path = os.path.join(APP_DIR, "scanned_object.glb")
+            if os.path.exists(default_path):
+                self.show_model(default_path)
+            else:
+                self.log("[!] No active 3D asset found. Generate or load a model first.")
+
+    @pyqtSlot()
+    def toggle_labels(self):
+        self._labels_visible = not self._labels_visible
+        state = "ON" if self._labels_visible else "OFF"
+        self.btn_toggle_labels.setText(f"Labels: {state}")
+        if self.stack.currentIndex() == 1:
+            self.webview.page().runJavaScript(
+                f"if(window.toggleLabels) window.toggleLabels({str(self._labels_visible).lower()});"
+            )
 
     @pyqtSlot()
     def open_current_in_blender(self):
-        """Open the current model or its .blend master scene in Blender."""
         if not self._current_model_path or not os.path.exists(self._current_model_path):
-            QMessageBox.warning(self, "No Model", "No 3D model loaded. Generate or load a model first.")
+            QMessageBox.warning(self, "No Asset", "No 3D model loaded. Generate or import a model first.")
             return
 
         export_dir = SETTINGS.get("export_dir", DEFAULT_EXPORT_DIR)
@@ -1339,312 +1507,157 @@ class ModernScannerApp(QMainWindow):
         blend_path = os.path.join(export_dir, f"{base_name}.blend")
 
         if not os.path.exists(blend_path):
-            self.log("Creating native Blender master workspace first...")
+            self.log("[*] Compiling native Blender workspace (.blend)...")
             self.export_for_blender("BLEND")
             return
 
-        self.log(f"🚀 Opening Blender with {blend_path}...")
+        self.log(f"[+] Launching Blender Studio with {os.path.basename(blend_path)}...")
         open_in_blender(blend_path)
 
-    # ── Export to Blender ─────────────────────────────────────────────────────
     @pyqtSlot()
     def export_for_blender(self, fmt):
-        """Export the current model in the specified format for Blender."""
         if not self._current_model_path or not os.path.exists(self._current_model_path):
-            QMessageBox.warning(self, "No Model", "No 3D model loaded. Generate or load a model first.")
+            QMessageBox.warning(self, "No Asset", "No 3D model loaded. Generate or import a model first.")
             return
 
         if fmt == "GLB":
-            # Just copy the GLB to exports
             export_dir = SETTINGS.get("export_dir", DEFAULT_EXPORT_DIR)
             os.makedirs(export_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            dest = os.path.join(export_dir, f"blender_export_{timestamp}.glb")
+            dest = os.path.join(export_dir, f"export_{timestamp}.glb")
             import shutil
             shutil.copy2(self._current_model_path, dest)
-            self.log(f"✅ GLB copied to: {dest}")
-            self.lbl_export_status.setText(f"✅ Exported: {os.path.basename(dest)}")
-            self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
-            
-            # Open the folder
+            self.log(f"[✓] GLB asset exported to: {dest}")
+            self.lbl_export_status.setText(os.path.basename(dest))
             os.startfile(export_dir)
             return
 
-        self.log(f"Starting {fmt} export for Blender...")
-        self.lbl_export_status.setText(f"⏳ Exporting {fmt}...")
-        self.lbl_export_status.setStyleSheet("color:#FF9800; font-size:10px;")
+        self.log(f"[*] Exporting asset as {fmt}...")
+        self.lbl_export_status.setText(f"Exporting {fmt}...")
 
         self._export_thread = BlenderExportThread(
             self._current_model_path, fmt, SETTINGS, self
         )
         self._export_thread.log_msg.connect(self.log)
         self._export_thread.export_done.connect(self._on_export_done)
-        self._export_thread.export_error.connect(self._on_export_error)
+        self._export_thread.export_error.connect(lambda e: self.log(f"[!] Export error: {e}"))
         self._export_thread.start()
 
     @pyqtSlot(str)
     def _on_export_done(self, path):
-        self.lbl_export_status.setText(f"✅ {os.path.basename(path)}")
-        self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
-        self.log(f"🎉 Export complete: {path}")
-        
-        # Open the export folder
-        export_dir = os.path.dirname(path)
-        os.startfile(export_dir)
+        self.lbl_export_status.setText(os.path.basename(path))
+        self.log(f"[✓] Export generated: {path}")
+        os.startfile(os.path.dirname(path))
 
+    # ── Three.js WebGL Viewport Server & Injection ────────────────────────────
     @pyqtSlot(str)
-    def _on_export_error(self, err):
-        self.lbl_export_status.setText(f"❌ Export failed")
-        self.lbl_export_status.setStyleSheet("color:#F44336; font-size:10px;")
-        self.log(f"❌ Export error: {err}")
+    def show_model(self, model_path):
+        import http.server
+        import urllib.parse
 
-    # ── Label Toggle ──────────────────────────────────────────────────────────
-    @pyqtSlot()
-    def toggle_labels(self):
-        self._labels_visible = not self._labels_visible
-        state = "ON" if self._labels_visible else "OFF"
-        self.btn_toggle_labels.setText(f"🏷  Labels: {state}")
-        # Send JS command to toggle labels in the viewer
-        if self.stack.currentIndex() == 1:
-            self.webview.page().runJavaScript(
-                f"if(window.toggleLabels) window.toggleLabels({str(self._labels_visible).lower()});"
-            )
-        self.log(f"Labels: {state}")
+        self._current_model_path = model_path
+        self.lbl_export_status.setText(os.path.basename(model_path))
 
-    # ── Scan actions ──────────────────────────────────────────────────────────
-    @pyqtSlot()
-    def start_scan(self):
-        self.btn_action.setDisabled(True)
-        self.btn_capture.setDisabled(True)
-        self.btn_reprocess.setDisabled(True)
-
-        mode = "Auto Turntable" if "Auto" in self.mode_btn.text() else "Manual Scan"
-        self._cam_auto_paused = False
-
-        if mode == "Auto Turntable" and not self.camera_enabled:
-            self.log("Enabling camera for Auto Turntable capture.")
-            self._start_camera_thread()
-
-        self.scan_thread = HardwareScanThread(
-            SETTINGS,
-            mode,
-            frame_supplier=self.get_latest_frame
-        )
-        self.scan_thread.log_msg.connect(self.log)
-        self.scan_thread.scan_complete.connect(self.show_model)
-        self.scan_thread.scan_error.connect(self.on_scan_error)
-        self.scan_thread.start()
-
-    @pyqtSlot()
-    def reprocess_existing_images(self):
-        self.btn_action.setDisabled(True)
-        self.btn_capture.setDisabled(True)
-        self.btn_reprocess.setDisabled(True)
-        self.log("Bypassing camera. Launching compiler with existing local folder files…")
-        self._cam_auto_paused = False
-        self.scan_thread = HardwareScanThread(SETTINGS, "Reprocess")
-        self.scan_thread.log_msg.connect(self.log)
-        self.scan_thread.scan_complete.connect(self.show_model)
-        self.scan_thread.scan_error.connect(self.on_scan_error)
-        self.scan_thread.start()
-
-    @pyqtSlot(str)
-    def on_scan_error(self, err_msg):
-        self.log(f"ERROR: {err_msg}")
-        self.btn_reprocess.setEnabled(True)
-        if "Auto" in self.mode_btn.text():
-            self.btn_action.setEnabled(True)
-        # Restart camera if it was auto-paused
-        if self._cam_auto_paused:
-            self._cam_auto_paused = False
-            self._start_camera_thread()
-            self.log("Camera resumed.")
-
-    @pyqtSlot()
-    def load_mesh(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load 3D Model", "", "GLB Files (*.glb)"
-        )
-        if path:
-            self.show_model(path)
-
-    @pyqtSlot()
-    def view_loaded_model(self):
-        target_path = self._current_model_path
-        if not target_path or not os.path.exists(target_path):
-            default_path = os.path.join(APP_DIR, "scanned_object.glb")
-            if os.path.exists(default_path):
-                target_path = default_path
-        if target_path and os.path.exists(target_path):
-            self.show_model(target_path)
-            self.log(f"Displaying 3D model: {os.path.basename(target_path)}")
-        else:
-            self.log("ERROR: No 3D model found to display. Generate or load a model first.")
-
-    # Backwards compatibility alias
-    def view_civis_model(self):
-        self.view_loaded_model()
-
-    @pyqtSlot()
-    def back_to_camera(self):
-        self.stack.setCurrentIndex(0)
-        if self.camera_enabled:
-            self.cam_lbl.setText("[ LIVE VIEWPORT ]")
-        else:
-            self.cam_lbl.setText("[ CAMERA DISABLED ]")
-        self.log("Switched back to camera view.")
-
-    @pyqtSlot(str)
-    def show_model(self, glb_path):
-        import http.server, urllib.parse
-
-        self._current_model_path = glb_path
-        self.lbl_export_status.setText(f"Ready: {os.path.basename(glb_path)}")
-        self.lbl_export_status.setStyleSheet("color:#4CAF50; font-size:10px;")
-
-        # Restart camera if it was auto-paused during Auto Turntable
-        if self._cam_auto_paused:
-            self._cam_auto_paused = False
-            self._start_camera_thread()
-            self.log("Camera resumed.")
+        # Update viewport navigation buttons
+        self.stack.setCurrentIndex(1)
+        self.btn_vp_cam.setProperty("active", False)
+        self.btn_vp_3d.setProperty("active", True)
+        self.btn_vp_cam.style().unpolish(self.btn_vp_cam)
+        self.btn_vp_cam.style().polish(self.btn_vp_cam)
+        self.btn_vp_3d.style().unpolish(self.btn_vp_3d)
+        self.btn_vp_3d.style().polish(self.btn_vp_3d)
 
         if hasattr(self, '_httpd') and self._httpd:
-            try:
-                self._httpd.shutdown()
-            except Exception:
-                pass
+            try: self._httpd.shutdown()
+            except Exception: pass
             self._httpd = None
 
         try:
-            glb_bytes = open(glb_path, "rb").read()
+            model_bytes = open(model_path, "rb").read()
         except Exception as e:
-            self.log(f"ERROR reading GLB: {e}")
+            self.log(f"[!] Error reading 3D model asset: {e}")
             return
 
-        # Read local Three.js files from app directory
-        js_files = {}  # path-key → bytes
+        js_files = {}
         for js_name in ("three.min.js", "OrbitControls.js", "GLTFLoader.js"):
             js_path = os.path.join(APP_DIR, js_name)
             if os.path.exists(js_path):
                 js_files[f"/{js_name}"] = open(js_path, "rb").read()
-            else:
-                self.log(f"[WARN] Missing {js_name} in app folder. Local viewer may fail.")
 
-        glb_filename = os.path.basename(glb_path)
+        model_filename = os.path.basename(model_path)
         html = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>3D Model Viewer — {glb_filename}</title>
+  <title>3D Viewport — {model_filename}</title>
   <style>
     * {{ margin:0; padding:0; box-sizing:border-box; }}
-    html, body {{ width:100%; height:100%; background:#0d1117; overflow:hidden; font-family:'Segoe UI',sans-serif; }}
+    html, body {{ width:100%; height:100%; background:#07090e; overflow:hidden; font-family:'Segoe UI',sans-serif; }}
     canvas {{ display:block; width:100%; height:100%; }}
-    #info {{
-      display:none; position:absolute; inset:0;
-      color:#999; font:16px sans-serif;
-      justify-content:center; align-items:center; text-align:center;
-    }}
     
-    /* ── 3D Label Styles ── */
+    /* ── Minimalist Engineering Callouts ── */
     .label-3d {{
       position: absolute;
       pointer-events: none;
       transform: translate(-50%, -100%);
       z-index: 100;
-      transition: opacity 0.3s ease;
+      transition: opacity 0.2s ease;
+      will-change: transform, opacity;
     }}
-    .label-3d.hidden {{
-      opacity: 0 !important;
-      pointer-events: none;
-    }}
-    .label-dot {{
-      width: 10px; height: 10px;
-      border-radius: 50%;
-      margin: 0 auto 4px;
-      box-shadow: 0 0 8px currentColor, 0 0 16px currentColor;
-      animation: pulse 2s ease-in-out infinite;
-    }}
-    .label-line {{
-      width: 2px; height: 26px;
-      margin: 0 auto;
-      background: linear-gradient(to bottom, currentColor, transparent);
-    }}
+    .label-3d.hidden {{ opacity: 0 !important; }}
+    
     .label-card {{
-      background: rgba(13, 17, 23, 0.92);
-      border: 1px solid;
-      border-radius: 8px;
-      padding: 5px 10px;
+      background: rgba(10, 14, 22, 0.94);
+      border: 1px solid #233044;
+      border-radius: 4px;
+      padding: 3px 8px;
       white-space: nowrap;
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      box-shadow: 0 4px 16px rgba(0,0,0,0.6);
+      font-family: 'Consolas', monospace;
     }}
     .label-name {{
-      font-size: 11px;
+      font-size: 9px;
       font-weight: 700;
       letter-spacing: 0.5px;
+      text-transform: uppercase;
     }}
     .label-desc {{
-      font-size: 9px;
-      opacity: 0.8;
-      margin-top: 2px;
+      font-size: 11px;
+      font-weight: 600;
+      color: #f1f5f9;
+      margin-top: 1px;
+    }}
+    .label-line {{
+      width: 1px;
+      height: 20px;
+      margin: 0 auto;
+      background: currentColor;
+      opacity: 0.5;
+    }}
+    .label-dot {{
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      margin: 0 auto;
+      background: currentColor;
     }}
     
-    /* ── Header Bar ── */
-    #header {{
-      position: absolute;
-      top: 0; left: 0; right: 0;
-      height: 44px;
-      background: linear-gradient(180deg, rgba(13,17,23,0.95) 0%, rgba(13,17,23,0) 100%);
-      display: flex;
-      align-items: center;
-      padding: 0 20px;
-      z-index: 200;
-    }}
-    #header h1 {{
-      font-size: 14px;
-      font-weight: 600;
-      color: #00BCD4;
-      letter-spacing: 0.5px;
-    }}
-    #header .dims {{
-      margin-left: auto;
-      font-size: 12px;
-      color: #00E676;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-      background: rgba(0, 230, 118, 0.1);
-      padding: 4px 10px;
-      border-radius: 4px;
-      border: 1px solid rgba(0, 230, 118, 0.2);
-    }}
-    
-    @keyframes pulse {{
-      0%, 100% {{ transform: scale(1); opacity:1; }}
-      50% {{ transform: scale(1.4); opacity:0.6; }}
+    #info-overlay {{
+      display:none; position:absolute; inset:0;
+      color:#94a3b8; font:14px sans-serif;
+      justify-content:center; align-items:center; text-align:center;
     }}
   </style>
 </head>
 <body>
-  <div id="header">
-    <h1 id="model-title">{glb_filename}</h1>
-    <span class="dims" id="model-dims">Measuring dimensions…</span>
-  </div>
   <div id="container"></div>
-  <div id="info" style="z-index: 9999;"><p>Loading 3D model…</p></div>
+  <div id="info-overlay"></div>
   <div id="labels-container"></div>
 
   <script src="/three.min.js"></script>
   <script src="/OrbitControls.js"></script>
   <script src="/GLTFLoader.js"></script>
   <script>
-    window.onerror = function(msg, url, line, col, error) {{
-      document.getElementById('info').style.display = 'flex';
-      document.getElementById('info').innerHTML = '<p style="color:red; font-size:18px; background:rgba(0,0,0,0.8); padding:20px; border-radius:5px;">JS Error: ' + msg + '<br>Line: ' + line + '</p>';
-      return false;
-    }};
-    
     var scene, camera, renderer, controls;
     var labelElements = [];
     var labelPositions = [];
@@ -1657,14 +1670,13 @@ class ModernScannerApp(QMainWindow):
       labelPositions = [];
 
       var wCm = (size.x * 100).toFixed(1);
-      var lCm = (size.y * 100).toFixed(1);
-      var hCm = (size.z * 100).toFixed(1);
+      var hCm = (size.y * 100).toFixed(1);
+      var dCm = (size.z * 100).toFixed(1);
 
       var markers = [
-        {{ name: 'Height (Top)', desc: hCm + ' cm', pos: new THREE.Vector3(center.x, box.max.y, center.z), color: '#00BCD4' }},
-        {{ name: 'Width (X-Span)', desc: wCm + ' cm', pos: new THREE.Vector3(box.max.x, center.y, center.z), color: '#FF9800' }},
-        {{ name: 'Depth (Z-Span)', desc: lCm + ' cm', pos: new THREE.Vector3(center.x, center.y, box.max.z), color: '#4CAF50' }},
-        {{ name: 'Origin Center', desc: 'Anchor Point', pos: center.clone(), color: '#E91E63' }}
+        {{ name: 'Height (Z)', desc: hCm + ' cm', pos: new THREE.Vector3(center.x, box.max.y, center.z), color: '#38bdf8' }},
+        {{ name: 'Width (X)', desc: wCm + ' cm', pos: new THREE.Vector3(box.max.x, center.y, center.z), color: '#10b981' }},
+        {{ name: 'Depth (Y)', desc: dCm + ' cm', pos: new THREE.Vector3(center.x, center.y, box.max.z), color: '#f59e0b' }}
       ];
 
       markers.forEach(function(m) {{
@@ -1672,12 +1684,12 @@ class ModernScannerApp(QMainWindow):
         el.className = 'label-3d';
         el.style.color = m.color;
         el.innerHTML = 
-          '<div class="label-card" style="border-color:' + m.color + '">' +
+          '<div class="label-card" style="border-color:' + m.color + '66">' +
             '<div class="label-name" style="color:' + m.color + '">' + m.name + '</div>' +
             '<div class="label-desc">' + m.desc + '</div>' +
           '</div>' +
           '<div class="label-line"></div>' +
-          '<div class="label-dot" style="background:' + m.color + '; color:' + m.color + '"></div>';
+          '<div class="label-dot"></div>';
         container.appendChild(el);
         labelElements.push(el);
         labelPositions.push(m.pos);
@@ -1688,25 +1700,21 @@ class ModernScannerApp(QMainWindow):
       if (!camera || !renderer) return;
       var width = renderer.domElement.clientWidth;
       var height = renderer.domElement.clientHeight;
-      
+
       for (var i = 0; i < labelElements.length; i++) {{
         var pos = labelPositions[i].clone();
         pos.project(camera);
-        
-        var x = (pos.x * 0.5 + 0.5) * width;
-        var y = (-pos.y * 0.5 + 0.5) * height;
-        
-        if (pos.z > 1) {{
+
+        if (pos.z > 1.0 || !labelsVisible) {{
           labelElements[i].style.opacity = '0';
         }} else {{
-          labelElements[i].style.opacity = labelsVisible ? '1' : '0';
-          labelElements[i].style.left = x + 'px';
-          labelElements[i].style.top = y + 'px';
+          labelElements[i].style.opacity = '1';
+          labelElements[i].style.left = ((pos.x * 0.5 + 0.5) * width) + 'px';
+          labelElements[i].style.top = ((-pos.y * 0.5 + 0.5) * height) + 'px';
         }}
       }}
     }}
 
-    // Global toggle function callable from Python
     window.toggleLabels = function(visible) {{
       labelsVisible = visible;
       labelElements.forEach(function(el) {{
@@ -1720,69 +1728,63 @@ class ModernScannerApp(QMainWindow):
 
     function init() {{
       scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x0d1117);
+      scene.background = new THREE.Color(0x07090e);
 
-      camera = new THREE.PerspectiveCamera(
-        45, window.innerWidth / window.innerHeight, 0.01, 1000
-      );
-      camera.position.set(0, 2, 5);
+      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.01, 1000);
+      camera.position.set(0, 1.8, 4.0);
 
-      renderer = new THREE.WebGLRenderer({{ antialias: true }});
+      renderer = new THREE.WebGLRenderer({{ antialias: true, alpha: false }});
       renderer.setSize(window.innerWidth, window.innerHeight);
-      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
       try {{ renderer.outputEncoding = THREE.sRGBEncoding; }} catch(e) {{}}
       document.getElementById('container').appendChild(renderer.domElement);
 
-      // Studio 3-point lighting
-      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-      
-      var d1 = new THREE.DirectionalLight(0xffffff, 1.0);
-      d1.position.set(5, 10, 7); scene.add(d1);
-      var d2 = new THREE.DirectionalLight(0xffffff, 0.5);
-      d2.position.set(-5, 5, -7); scene.add(d2);
-      var d3 = new THREE.DirectionalLight(0x00BCD4, 0.3);
-      d3.position.set(0, -3, 5); scene.add(d3);
+      // Studio Lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+      var d1 = new THREE.DirectionalLight(0xfff7ed, 1.2);
+      d1.position.set(4, 7, 5); scene.add(d1);
+      var d2 = new THREE.DirectionalLight(0xe0f2fe, 0.6);
+      d2.position.set(-5, 4, -4); scene.add(d2);
+      var d3 = new THREE.DirectionalLight(0x38bdf8, 0.4);
+      d3.position.set(0, -4, -6); scene.add(d3);
 
-      // Subtle ground grid
-      var gridHelper = new THREE.GridHelper(4, 20, 0x1a2332, 0x111827);
-      scene.add(gridHelper);
+      // Ground Grid
+      var grid = new THREE.GridHelper(3.0, 30, 0x1f2737, 0x111622);
+      scene.add(grid);
 
       controls = new THREE.OrbitControls(camera, renderer.domElement);
       controls.enableDamping = true;
-      controls.dampingFactor = 0.08;
+      controls.dampingFactor = 0.06;
       controls.autoRotate = true;
-      controls.autoRotateSpeed = 1.5;
+      controls.autoRotateSpeed = 1.0;
 
       var loader = new THREE.GLTFLoader();
       loader.load('/model.glb', function(gltf) {{
         var model = gltf.scene;
         scene.add(model);
+
         var box = new THREE.Box3().setFromObject(model);
         var center = box.getCenter(new THREE.Vector3());
         var size = box.getSize(new THREE.Vector3());
-        controls.target.copy(center);
+
+        model.position.x -= center.x;
+        model.position.y -= box.min.y;
+        model.position.z -= center.z;
+
+        box.setFromObject(model);
+        var groundedCenter = box.getCenter(new THREE.Vector3());
+
         var maxDim = Math.max(size.x, size.y, size.z);
-        camera.position.copy(center);
-        camera.position.z += maxDim * 2.5;
-        camera.lookAt(center);
+        camera.position.set(groundedCenter.x, groundedCenter.y + maxDim * 0.4, groundedCenter.z + maxDim * 2.2);
+        controls.target.copy(groundedCenter);
         controls.update();
 
-        // Dynamically calculate and display real dimensions in cm
-        var dimsEl = document.getElementById('model-dims');
-        if (dimsEl) {{
-          var wCm = (size.x * 100).toFixed(1);
-          var lCm = (size.y * 100).toFixed(1);
-          var hCm = (size.z * 100).toFixed(1);
-          dimsEl.textContent = wCm + ' × ' + lCm + ' × ' + hCm + ' cm';
-        }}
-
-        // Create bounding measurement annotations
-        createDimensionLabels(box, center, size);
-
-      }}, undefined, function(error) {{
-        console.error('GLB load error:', error);
-        document.getElementById('info').style.display = 'flex';
-        document.getElementById('info').innerHTML = '<p style="color:red; font-size:18px; background:rgba(0,0,0,0.8); padding:20px;">Failed to load GLB: ' + ((error && error.message) ? error.message : error) + '</p>';
+        createDimensionLabels(box, groundedCenter, size);
+      }}, undefined, function(err) {{
+        document.getElementById('info-overlay').style.display = 'flex';
+        document.getElementById('info-overlay').textContent = 'Error loading GLB asset.';
       }});
 
       window.addEventListener('resize', function() {{
@@ -1790,6 +1792,7 @@ class ModernScannerApp(QMainWindow):
         camera.updateProjectionMatrix();
         renderer.setSize(window.innerWidth, window.innerHeight);
       }});
+
       animate();
     }}
 
@@ -1815,55 +1818,47 @@ class ModernScannerApp(QMainWindow):
                     self_h.send_response(200)
                     self_h.send_header("Content-Type", "text/html; charset=utf-8")
                     self_h.send_header("Content-Length", str(len(html_bytes)))
-                    self_h.end_headers(); self_h.wfile.write(html_bytes)
+                    self_h.end_headers()
+                    self_h.wfile.write(html_bytes)
                 elif p == "/model.glb":
                     self_h.send_response(200)
                     self_h.send_header("Content-Type", "model/gltf-binary")
-                    self_h.send_header("Content-Length", str(len(glb_bytes)))
+                    self_h.send_header("Content-Length", str(len(model_bytes)))
                     self_h.send_header("Access-Control-Allow-Origin", "*")
-                    self_h.end_headers(); self_h.wfile.write(glb_bytes)
+                    self_h.end_headers()
+                    self_h.wfile.write(model_bytes)
                 elif p in js_files:
                     data = js_files[p]
                     self_h.send_response(200)
                     self_h.send_header("Content-Type", "application/javascript")
                     self_h.send_header("Content-Length", str(len(data)))
-                    self_h.end_headers(); self_h.wfile.write(data)
+                    self_h.end_headers()
+                    self_h.wfile.write(data)
                 else:
-                    self_h.send_response(404); self_h.end_headers()
+                    self_h.send_response(404)
+                    self_h.end_headers()
 
-        # SUPER IMPORTANT: Use ThreadingHTTPServer so browser parallel downloads don't deadlock!
         self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         port = self._httpd.server_address[1]
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
 
         viewer_url = f"http://127.0.0.1:{port}/"
         self.webview.setUrl(QUrl(viewer_url))
-        self.stack.setCurrentIndex(1)
-        self.log(f"Viewer active: {glb_filename}")
-        self.log(f'<a href="{viewer_url}" style="color:#64B5F6; text-decoration:underline;">&#128279; CLICK HERE TO OPEN 3D VIEWER IN BROWSER</a>')
-
-        import webbrowser
-        try:
-            webbrowser.open(viewer_url)
-        except Exception as e:
-            self.log(f"Could not auto-open browser: {e}")
-
-        self.btn_reprocess.setEnabled(True)
-        if "Auto" in self.mode_btn.text():
-            self.btn_action.setEnabled(True)
+        self.lbl_vp_telemetry.setText(f"ACTIVE ASSET: {model_filename}")
+        self.log(f"[✓] 3D Viewport active: {model_filename}")
 
     def closeEvent(self, event):
-        if self.camera_enabled:
+        if self.camera_enabled and hasattr(self, 'camera_thread'):
             self.camera_thread.stop()
         if hasattr(self, '_httpd') and self._httpd:
             self._httpd.shutdown()
         event.accept()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
-    w   = ModernScannerApp()
+    w = ModernScannerApp()
     w.show()
     sys.exit(app.exec())

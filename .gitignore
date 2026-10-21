@@ -10,9 +10,16 @@ scan/
 __pycache__/
 *.py[cod]
 
+# TripoSR cloned repo (auto-downloaded, ~1.5GB)
+TripoSR/
+
 # OS files
 .DS_Store
 Thumbs.db
 
 # Editor folders
 .vscode/
+
+# Large model files
+*.glb
+*.blend1

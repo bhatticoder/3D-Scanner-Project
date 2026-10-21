@@ -1,8 +1,6 @@
 {
-    "tripo_api_key": "tsk_WBY9ZiteJ44mxL9nxU8eojihn72ZNzjgeg7l__YaY4M",
     "arduino_port": "COM4",
     "arduino_baud": 9600,
-    "output_path": "d:\\Projects\\app\\scanned_object.glb",
     "num_images": 8,
     "camera_index": 1,
     "students": [
@@ -15,6 +13,10 @@
             "roll": "22f-1111"
         }
     ],
-    "export_dir": "d:/Projects/app/exports",
-    "rotation_step": 10
+    "export_dir": "exports",
+    "rotation_step": 10,
+    "mesh_resolution": 256,
+    "device": "auto",
+    "foreground_ratio": 0.85,
+    "remove_background": true
 }

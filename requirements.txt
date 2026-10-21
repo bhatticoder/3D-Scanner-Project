@@ -1,6 +1,17 @@
+# ── Core Dependencies ──
 PyQt6>=6.0.0
 PyQt6-WebEngine>=6.0.0
 opencv-python>=4.5.0
 requests>=2.25.0
 trimesh>=3.9.0
 pyserial>=3.5
+
+# ── Open-Source 3D AI (TripoSR) ──
+torch>=2.0.0
+torchvision>=0.15.0
+Pillow>=9.0.0
+transformers>=4.30.0
+einops>=0.6.0
+omegaconf>=2.3.0
+rembg>=2.0.50
+huggingface-hub>=0.20.0

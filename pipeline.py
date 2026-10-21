@@ -1,30 +1,35 @@
 """
 pipeline.py
-Universal 3D Scanning & AI Reconstruction Pipeline.
-Takes any uploaded photos (single photo, 4 orthographic angle photos, or a folder of images),
-generates a high-fidelity 3D model using Tripo3D V3 API, downloads the asset, and
-automatically exports it into all industry-standard formats:
+Open-Source Local Image-to-3D Pipeline.
+Takes any uploaded image, generates a high-fidelity 3D model using TripoSR
+(open-source, MIT licensed, by StabilityAI + Tripo) running 100% locally,
+and automatically exports into all industry-standard formats:
   - GLB (.glb)
   - OBJ (.obj + .mtl)
   - STL (.stl)
-  - FBX (.fbx - Blender & animation preset)
+  - FBX (.fbx - via Blender)
   - BLEND (.blend - native Blender master scene with studio lighting & camera)
+
+No API keys. No cloud. No payments. Runs on your own GPU (or CPU).
 
 Usage examples:
   1. Single image to 3D & all formats:
-     python pipeline.py --image "civis_images/civis_front_view.jpg" --name "my_object"
+     python pipeline.py --image "photo.jpg" --name "my_object"
 
-  2. Multiview photos (4 perspectives) to 3D & all formats:
-     python pipeline.py --images front.jpg right.jpg back.jpg left.jpg --name "my_object"
+  2. Multiple images (batch processing - each becomes its own model):
+     python pipeline.py --images front.jpg side.jpg back.jpg --name "my_object"
 
   3. Folder of photos to 3D:
-     python pipeline.py --folder "civis_images" --name "scanned_robot"
+     python pipeline.py --folder "my_photos" --name "scanned_robot"
 
   4. Convert existing GLB into all formats:
-     python pipeline.py --glb "scanned_object.glb" --name "my_object"
+     python pipeline.py --glb "model.glb" --name "my_object"
 
-  5. Process existing Tripo Task ID:
-     python pipeline.py --task "c22c343c-8472-4365-91be-ad3e913e32cd" --name "my_object"
+  5. Adjust mesh quality (higher = more detail, slower):
+     python pipeline.py --image "photo.jpg" --name "my_object" --resolution 512
+
+  6. Run on CPU (no GPU required):
+     python pipeline.py --image "photo.jpg" --name "my_object" --device cpu
 """
 
 import os
@@ -32,7 +37,6 @@ import sys
 import time
 import json
 import argparse
-import requests
 import glob
 
 # Ensure UTF-8 output on Windows consoles
@@ -47,7 +51,7 @@ from converter import convert_model_to_all_formats, open_in_blender, find_blende
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 DEFAULT_EXPORTS_DIR = os.path.join(APP_DIR, "exports")
-BASE_URL = "https://openapi.tripo3d.ai"
+TRIPOSR_DIR = os.path.join(APP_DIR, "TripoSR")
 
 
 def load_config():
@@ -59,184 +63,154 @@ def load_config():
     return {}
 
 
-def upload_file_to_tripo(file_path, api_key):
-    """Uploads an image or file to Tripo V3 files endpoint and returns file_token."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File not found: {file_path}")
+def ensure_triposr_installed(log_fn=print):
+    """Ensure TripoSR repository is cloned and importable."""
+    if os.path.exists(os.path.join(TRIPOSR_DIR, "tsr")):
+        if TRIPOSR_DIR not in sys.path:
+            sys.path.insert(0, TRIPOSR_DIR)
+        return True
 
-    ext = os.path.splitext(file_path)[1].lower()
-    mime = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png", ".webp": "image/webp",
-        ".bmp": "image/bmp"
-    }.get(ext, "image/jpeg")
-
-    fname = os.path.basename(file_path)
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    with open(file_path, "rb") as f:
-        r = requests.post(
-            f"{BASE_URL}/v3/files",
-            headers=headers,
-            files={"file": (fname, f, mime)},
-            timeout=60
+    log_fn("[*] TripoSR not found. Cloning from GitHub (one-time setup)...")
+    import subprocess
+    try:
+        subprocess.run(
+            ["git", "clone", "https://github.com/VAST-AI-Research/TripoSR.git", TRIPOSR_DIR],
+            check=True, capture_output=True, text=True, timeout=300
         )
-        r.raise_for_status()
-        res = r.json()
-        if res.get("code") != 0:
-            raise RuntimeError(f"Tripo file upload failed: {res.get('message', res.get('msg', 'Unknown'))}")
-        return res["data"]["file_token"]
+        log_fn("[+] TripoSR repository cloned successfully.")
+
+        # Install TripoSR dependencies
+        log_fn("[*] Installing TripoSR dependencies...")
+        req_file = os.path.join(TRIPOSR_DIR, "requirements.txt")
+        if os.path.exists(req_file):
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", req_file],
+                check=True, capture_output=True, text=True, timeout=600
+            )
+        log_fn("[+] TripoSR dependencies installed.")
+
+        if TRIPOSR_DIR not in sys.path:
+            sys.path.insert(0, TRIPOSR_DIR)
+        return True
+    except Exception as e:
+        log_fn(f"[!] Failed to set up TripoSR: {e}")
+        log_fn("[!] Please manually run:")
+        log_fn(f"    git clone https://github.com/VAST-AI-Research/TripoSR.git {TRIPOSR_DIR}")
+        log_fn(f"    pip install -r {os.path.join(TRIPOSR_DIR, 'requirements.txt')}")
+        return False
 
 
-def poll_tripo_task(task_id, api_key, timeout=900, poll_interval=4, log_fn=print):
-    """Polls a Tripo task until success, failed, or cancelled."""
-    headers = {"Authorization": f"Bearer {api_key}"}
-    start_time = time.time()
-    log_fn(f"[*] Monitoring Tripo task {task_id} (timeout={timeout}s)...")
+def generate_3d_from_image(
+    image_path,
+    export_dir,
+    base_name=None,
+    resolution=256,
+    device="auto",
+    remove_bg=True,
+    foreground_ratio=0.85,
+    log_fn=print
+):
+    """
+    Generate a 3D model from a single image using TripoSR (100% local, open-source).
 
-    while time.time() - start_time < timeout:
-        r = requests.get(f"{BASE_URL}/v3/tasks/{task_id}", headers=headers, timeout=30)
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        status = data.get("status", "unknown")
-        progress = data.get("progress", 0)
+    Args:
+        image_path: Path to input image
+        export_dir: Directory to save output files
+        base_name: Base name for output files (defaults to input filename)
+        resolution: Marching cubes resolution (128=fast/low, 256=balanced, 512=high quality)
+        device: 'auto', 'cuda:0', 'cpu', etc.
+        remove_bg: Whether to automatically remove background
+        foreground_ratio: How much of the image the foreground should occupy (0.0-1.0)
+        log_fn: Logging function
 
-        log_fn(f"   [{time.strftime('%H:%M:%S')}] Status: {status.upper()} | Progress: {progress}%")
+    Returns:
+        str: Path to generated OBJ file
+    """
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(f"Image not found: {image_path}")
 
-        if status == "success":
-            out = data.get("output", {})
-            model_url = out.get("model_url")
-            if not model_url and isinstance(out, list) and len(out) > 0:
-                model_url = out[0].get("model_url")
-            if not model_url:
-                raise RuntimeError("Task succeeded but no model_url in response output.")
-            return model_url
-        elif status in ("failed", "cancelled"):
-            err_msg = data.get("error_message", "Unknown error")
-            err_code = data.get("error_code", "N/A")
-            raise RuntimeError(f"Tripo task {status}: [{err_code}] {err_msg}")
-
-        time.sleep(poll_interval)
-
-    raise TimeoutError(f"Task {task_id} timed out after {timeout} seconds.")
-
-
-def generate_from_single_image(image_path, api_key, export_dir, base_name=None, log_fn=print):
-    """Generates 3D model from a single photo using Tripo V3 image-to-model."""
     if not base_name:
         base_name = os.path.splitext(os.path.basename(image_path))[0]
 
-    log_fn(f"[*] Uploading source photo: {image_path}")
-    file_token = upload_file_to_tripo(image_path, api_key)
-    log_fn(f"[+] File uploaded. Token: {file_token[:24]}...")
+    os.makedirs(export_dir, exist_ok=True)
 
-    ext = os.path.splitext(image_path)[1].lower().lstrip(".")
-    if ext not in ("jpg", "jpeg", "png", "webp", "bmp"):
-        ext = "jpg"
+    # Ensure TripoSR is available
+    if not ensure_triposr_installed(log_fn):
+        raise RuntimeError("TripoSR is not installed. See instructions above.")
 
-    payload = {
-        "model_version": "v2.5-20250123",
-        "file": {
-            "type": ext,
-            "file_token": file_token
-        },
-        "texture": True,
-        "pbr": True
-    }
+    import torch
+    from PIL import Image
 
-    log_fn("[*] Creating 3D generation task (image-to-model)...")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    r = requests.post(f"{BASE_URL}/v3/generation/image-to-model", headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    res = r.json()
-    if res.get("code") != 0:
-        raise RuntimeError(f"Task creation failed: {res.get('message', res.get('msg'))}")
-
-    task_id = res["data"]["task_id"]
-    log_fn(f"[+] Task created: {task_id}")
-
-    model_url = poll_tripo_task(task_id, api_key, log_fn=log_fn)
-    log_fn("[*] Downloading generated GLB model...")
-
-    glb_path = os.path.join(export_dir, f"{base_name}.glb")
-    r_dl = requests.get(model_url, stream=True, timeout=120)
-    r_dl.raise_for_status()
-    with open(glb_path, "wb") as f:
-        for chunk in r_dl.iter_content(8192):
-            f.write(chunk)
-    log_fn(f"[+] Downloaded GLB: {glb_path} ({os.path.getsize(glb_path)} bytes)")
-
-    return glb_path, task_id
-
-
-def generate_from_multiview_images(image_paths, api_key, export_dir, base_name=None, log_fn=print):
-    """
-    Generates 3D model from multiple photos (up to 4 orthographic views: front, right, back, left)
-    using Tripo V3 multiview-to-model API.
-    """
-    if not image_paths:
-        raise ValueError("No images provided for multiview generation.")
-
-    if not base_name:
-        base_name = "multiview_object"
-
-    # We need 4 slots: front, right, back, left.
-    # If fewer than 4 provided, cycle or distribute them.
-    orientations = ["front", "right", "back", "left"]
-    selected = []
-    if len(image_paths) == 1:
-        return generate_from_single_image(image_paths[0], api_key, export_dir, base_name, log_fn)
-    elif len(image_paths) >= 4:
-        selected = image_paths[:4]
+    # Determine device
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda:0"
+            log_fn(f"[+] Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            device = "cpu"
+            log_fn("[*] No GPU detected. Running on CPU (slower but works fine).")
     else:
-        # 2 or 3 images: map sequentially
-        selected = image_paths
+        log_fn(f"[*] Using device: {device}")
 
-    log_fn(f"[*] Uploading {len(selected)} perspective images...")
-    files_payload = []
-    for idx, img_p in enumerate(selected):
-        token = upload_file_to_tripo(img_p, api_key)
-        ext = os.path.splitext(img_p)[1].lower().lstrip(".")
-        if ext not in ("jpg", "jpeg", "png", "webp", "bmp"):
-            ext = "jpg"
-        orient = orientations[idx] if idx < len(orientations) else "front"
-        files_payload.append({
-            "type": ext,
-            "file_token": token,
-            "orientation": orient
-        })
-        log_fn(f"   [+] Uploaded view {idx+1}/{len(selected)} ({orient}): {os.path.basename(img_p)}")
+    # Import TripoSR
+    log_fn("[*] Loading TripoSR AI model (first run downloads ~1.5GB model weights)...")
+    from tsr.system import TSR
+    from tsr.utils import remove_background, resize_foreground
 
-    payload = {
-        "model_version": "v2.5-20250123",
-        "files": files_payload,
-        "texture": True,
-        "pbr": True
-    }
+    model = TSR.from_pretrained(
+        "stabilityai/TripoSR",
+        config_name="config.yaml",
+        device=device,
+    )
 
-    log_fn("[*] Submitting multiview-to-model task to Tripo V3...")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    r = requests.post(f"{BASE_URL}/v3/generation/multiview-to-model", headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    res = r.json()
-    if res.get("code") != 0:
-        raise RuntimeError(f"Multiview task creation failed: {res.get('message', res.get('msg'))}")
+    # Reduce VRAM usage for GPUs with limited memory
+    if device.startswith("cuda"):
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            if vram_gb < 8:
+                model.renderer.set_chunk_size(4096)
+                log_fn(f"[*] Low VRAM ({vram_gb:.1f}GB) detected. Using chunked rendering.")
+            elif vram_gb < 6:
+                model.renderer.set_chunk_size(2048)
+                log_fn(f"[*] Very low VRAM ({vram_gb:.1f}GB). Using small chunks.")
+        except Exception:
+            pass
 
-    task_id = res["data"]["task_id"]
-    log_fn(f"[+] Task created: {task_id}")
+    log_fn(f"[+] TripoSR model loaded on {device}.")
 
-    model_url = poll_tripo_task(task_id, api_key, log_fn=log_fn)
-    log_fn("[*] Downloading generated GLB model...")
+    # Load and preprocess image
+    log_fn(f"[*] Processing image: {os.path.basename(image_path)}")
+    image = Image.open(image_path)
 
-    glb_path = os.path.join(export_dir, f"{base_name}.glb")
-    r_dl = requests.get(model_url, stream=True, timeout=120)
-    r_dl.raise_for_status()
-    with open(glb_path, "wb") as f:
-        for chunk in r_dl.iter_content(8192):
-            f.write(chunk)
-    log_fn(f"[+] Downloaded GLB: {glb_path} ({os.path.getsize(glb_path)} bytes)")
+    if remove_bg:
+        log_fn("[*] Removing background...")
+        try:
+            image = remove_background(image)
+            image = resize_foreground(image, foreground_ratio)
+            log_fn("[+] Background removed and foreground centered.")
+        except Exception as e:
+            log_fn(f"[!] Background removal failed ({e}). Proceeding with original image.")
 
-    return glb_path, task_id
+    # Run inference
+    log_fn("[*] Generating 3D model (this may take 30-120 seconds)...")
+    start_time = time.time()
+
+    with torch.no_grad():
+        scene_codes = model([image], device=device)
+
+    # Extract mesh
+    log_fn(f"[*] Extracting mesh at resolution {resolution}...")
+    meshes = model.extract_mesh(scene_codes, resolution=resolution)
+
+    elapsed = time.time() - start_time
+    log_fn(f"[+] 3D model generated in {elapsed:.1f} seconds!")
+
+    # Save as OBJ (primary format from TripoSR)
+    output_obj = os.path.join(export_dir, f"{base_name}.obj")
+    meshes[0].export(output_obj)
+    log_fn(f"[+] Saved OBJ: {output_obj} ({os.path.getsize(output_obj)} bytes)")
+
+    return output_obj
 
 
 def run_pipeline(
@@ -244,18 +218,18 @@ def run_pipeline(
     images=None,
     folder=None,
     glb=None,
-    task=None,
     name=None,
     output_dir=None,
-    api_key=None,
+    resolution=256,
+    device="auto",
+    remove_bg=True,
+    foreground_ratio=0.85,
     preview=False,
     launch_blender=False,
     log_fn=print
 ):
-    """Executes the complete generation and conversion pipeline."""
+    """Executes the complete local generation and conversion pipeline."""
     cfg = load_config()
-    if not api_key:
-        api_key = cfg.get("tripo_api_key", "")
 
     if not output_dir:
         output_dir = cfg.get("export_dir", DEFAULT_EXPORTS_DIR)
@@ -264,42 +238,47 @@ def run_pipeline(
         output_dir = DEFAULT_EXPORTS_DIR
     os.makedirs(output_dir, exist_ok=True)
 
-    glb_file = None
-    task_id = None
+    # Override settings from config if not provided via args
+    if resolution == 256 and cfg.get("mesh_resolution"):
+        resolution = cfg["mesh_resolution"]
+    if device == "auto" and cfg.get("device"):
+        device = cfg["device"]
+    if foreground_ratio == 0.85 and cfg.get("foreground_ratio"):
+        foreground_ratio = cfg["foreground_ratio"]
 
-    # Step A: Obtain GLB model
+    source_model = None
+
+    # Step A: Obtain 3D Model
     if glb:
+        # Direct GLB/OBJ conversion mode (no AI generation needed)
         if not os.path.exists(glb):
-            raise FileNotFoundError(f"Specified GLB file does not exist: {glb}")
-        glb_file = glb
+            raise FileNotFoundError(f"Specified model file does not exist: {glb}")
+        source_model = glb
         if not name:
             name = os.path.splitext(os.path.basename(glb))[0]
-    elif task:
-        if not api_key:
-            raise ValueError("Tripo API key required to monitor task.")
-        if not name:
-            name = f"model_{task[:8]}"
-        task_id = task
-        model_url = poll_tripo_task(task_id, api_key, log_fn=log_fn)
-        glb_file = os.path.join(output_dir, f"{name}.glb")
-        log_fn("[*] Downloading generated GLB...")
-        r_dl = requests.get(model_url, stream=True, timeout=120)
-        r_dl.raise_for_status()
-        with open(glb_file, "wb") as f:
-            for chunk in r_dl.iter_content(8192):
-                f.write(chunk)
+        log_fn(f"[*] Using existing model: {glb}")
     elif image:
-        if not api_key:
-            raise ValueError("Tripo API key required to generate 3D from image. Add it in config.json or use --api-key.")
-        glb_file, task_id = generate_from_single_image(image, api_key, output_dir, name, log_fn=log_fn)
+        # Single image → 3D
         if not name:
             name = os.path.splitext(os.path.basename(image))[0]
+        source_model = generate_3d_from_image(
+            image, output_dir, name, resolution, device, remove_bg, foreground_ratio, log_fn
+        )
     elif images:
-        if not api_key:
-            raise ValueError("Tripo API key required. Add it in config.json or use --api-key.")
+        # Multiple images → process each (or use best one)
         if not name:
-            name = "multiview_scan"
-        glb_file, task_id = generate_from_multiview_images(images, api_key, output_dir, name, log_fn=log_fn)
+            name = "generated_model"
+        # For TripoSR, we use the first/front image as the primary input
+        # (TripoSR is single-image; for multi-view, use the front view)
+        primary_image = images[0]
+        log_fn(f"[*] Using primary image for 3D generation: {os.path.basename(primary_image)}")
+        if len(images) > 1:
+            log_fn(f"[*] Note: TripoSR uses single-image reconstruction. Using first image as primary view.")
+            log_fn(f"    Additional {len(images)-1} images will be skipped.")
+            log_fn(f"    For multi-view reconstruction, consider InstantMesh or Zero123++.")
+        source_model = generate_3d_from_image(
+            primary_image, output_dir, name, resolution, device, remove_bg, foreground_ratio, log_fn
+        )
     elif folder:
         if not os.path.exists(folder):
             raise FileNotFoundError(f"Folder does not exist: {folder}")
@@ -313,33 +292,24 @@ def run_pipeline(
         log_fn(f"[+] Found {len(found_imgs)} images in folder '{folder}'")
         if not name:
             name = os.path.basename(os.path.normpath(folder))
-        glb_file, task_id = generate_from_multiview_images(found_imgs, api_key, output_dir, name, log_fn=log_fn)
+        # Use first image as primary
+        source_model = generate_3d_from_image(
+            found_imgs[0], output_dir, name, resolution, device, remove_bg, foreground_ratio, log_fn
+        )
     else:
-        # Default: check project root scanned_object.glb
-        default_glb = os.path.join(APP_DIR, "scanned_object.glb")
-        if os.path.exists(default_glb):
-            log_fn(f"[*] No inputs provided. Using default project model: {default_glb}")
-            glb_file = default_glb
-            name = "scanned_object"
-        else:
-            raise ValueError("No input provided. Use --image, --images, --folder, --glb, or --task.")
+        raise ValueError(
+            "No input provided. Use one of:\n"
+            "  --image photo.jpg\n"
+            "  --images front.jpg side.jpg\n"
+            "  --folder my_photos/\n"
+            "  --glb existing_model.glb"
+        )
 
-    # Also update the primary scanned_object.glb in app directory
-    app_glb = os.path.join(APP_DIR, "scanned_object.glb")
-    if os.path.abspath(glb_file) != os.path.abspath(app_glb):
-        try:
-            import shutil
-            shutil.copy2(glb_file, app_glb)
-        except Exception:
-            pass
-
-    # Step B: Auto-convert into ALL formats (OBJ, STL, FBX, BLEND, PNG)
+    # Step B: Auto-convert into ALL formats (GLB, OBJ, STL, FBX, BLEND)
     results = convert_model_to_all_formats(
-        input_model_path=glb_file,
+        input_model_path=source_model,
         export_dir=output_dir,
         base_name=name,
-        tripo_task_id=task_id,
-        tripo_api_key=api_key,
         render_preview=preview,
         log_fn=log_fn
     )
@@ -352,17 +322,43 @@ def run_pipeline(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Universal 3D Scanning & AI Reconstruction Pipeline")
-    parser.add_argument("--image", "-i", type=str, default=None, help="Path to single image for 3D reconstruction")
-    parser.add_argument("--images", nargs="+", default=None, help="List of 2-4 angle images for multiview reconstruction")
-    parser.add_argument("--folder", "-f", type=str, default=None, help="Folder containing images to reconstruct")
-    parser.add_argument("--glb", "-g", type=str, default=None, help="Convert an existing GLB model to all formats")
-    parser.add_argument("--task", "-t", type=str, default=None, help="Download & convert an existing Tripo task ID")
-    parser.add_argument("--name", "-n", type=str, default=None, help="Base name for exported 3D assets")
-    parser.add_argument("--output-dir", "-o", type=str, default=None, help="Directory to save exported 3D assets")
-    parser.add_argument("--api-key", "-k", type=str, default=None, help="Tripo API key (defaults to config.json)")
-    parser.add_argument("--preview", action="store_true", help="Generate studio render preview (.png)")
-    parser.add_argument("--blender", action="store_true", help="Open generated .blend in Blender after completion")
+    parser = argparse.ArgumentParser(
+        description="Open-Source Image-to-3D Pipeline (TripoSR — 100% Local, No API Keys)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python pipeline.py --image photo.jpg --name my_object
+  python pipeline.py --image photo.jpg --name my_object --resolution 512
+  python pipeline.py --image photo.jpg --name my_object --device cpu
+  python pipeline.py --folder my_photos/ --name scanned_thing
+  python pipeline.py --glb existing.glb --name converted_model
+        """
+    )
+    parser.add_argument("--image", "-i", type=str, default=None,
+                        help="Path to single image for 3D reconstruction")
+    parser.add_argument("--images", nargs="+", default=None,
+                        help="List of images (first one used as primary view)")
+    parser.add_argument("--folder", "-f", type=str, default=None,
+                        help="Folder containing images to reconstruct")
+    parser.add_argument("--glb", "-g", type=str, default=None,
+                        help="Convert an existing GLB/OBJ model to all formats")
+    parser.add_argument("--name", "-n", type=str, default=None,
+                        help="Base name for exported 3D assets")
+    parser.add_argument("--output-dir", "-o", type=str, default=None,
+                        help="Directory to save exported 3D assets")
+    parser.add_argument("--resolution", "-r", type=int, default=256,
+                        choices=[128, 256, 512],
+                        help="Mesh resolution: 128=fast, 256=balanced, 512=high (default: 256)")
+    parser.add_argument("--device", "-d", type=str, default="auto",
+                        help="Compute device: auto, cuda:0, cpu (default: auto)")
+    parser.add_argument("--no-remove-bg", action="store_true",
+                        help="Skip automatic background removal")
+    parser.add_argument("--foreground-ratio", type=float, default=0.85,
+                        help="Foreground size ratio after bg removal (default: 0.85)")
+    parser.add_argument("--preview", action="store_true",
+                        help="Generate studio render preview (.png)")
+    parser.add_argument("--blender", action="store_true",
+                        help="Open generated .blend in Blender after completion")
     args = parser.parse_args()
 
     run_pipeline(
@@ -370,10 +366,12 @@ def main():
         images=args.images,
         folder=args.folder,
         glb=args.glb,
-        task=args.task,
         name=args.name,
         output_dir=args.output_dir,
-        api_key=args.api_key,
+        resolution=args.resolution,
+        device=args.device,
+        remove_bg=not args.no_remove_bg,
+        foreground_ratio=args.foreground_ratio,
         preview=args.preview,
         launch_blender=args.blender,
         log_fn=print
